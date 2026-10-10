@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "desktop-agent"
+version = "0.1.0"
+description = "Local Windows desktop agent: screen, OCR, mouse, keyboard, and MilesMemory"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["pillow>=10"]
+
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+desktop-agent-example = "desktop_agent.agents.example_loop:main"
+
+[tool.setuptools.packages.find]
+include = ["desktop_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

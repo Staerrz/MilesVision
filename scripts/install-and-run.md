@@ -1,0 +1,74 @@
+# Install and run
+
+Windows is the desktop this agent drives. The Python package installs on other
+systems so the dry-run loop and tests can run, but `ImageGrab`, `user32`, and
+`os.startfile` execute only on Windows.
+
+## Install
+
+From the repository root, in PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[ocr,dev]"
+```
+
+Tesseract is the default OCR engine. Install the binary and make sure
+`tesseract` is on `PATH`, or set `TESSERACT_CMD` to `tesseract.exe`.
+
+```powershell
+winget install UB-Mannheim.TesseractOCR
+```
+
+Long-term memory is MilesMemory (`memory_kb` on `main`). This tree does not
+vendor it. Session events work without it. Recall and search need the package:
+
+```powershell
+git clone https://github.com/Staerrz/MilesMemory.git
+python -m pip install -e .\MilesMemory
+```
+
+The database file defaults to `memory_kb.db` in the working directory. Override
+it with `MEMORY_KB_DB`. The first archived summary calls `build_index` when the
+index is missing, which is what MilesMemory requires before `memory_recall` and
+`search_memories` will run.
+
+Optional OCR swaps:
+
+* `DESKTOP_AGENT_OCR=ollama` uses the `read_text` prompt against
+  `OLLAMA_VISION_OLLAMA_URL` (default `http://localhost:11434`) and
+  `OLLAMA_VISION_DEFAULT_MODEL` (default `llava-phi3`). Pull the model with
+  `ollama pull llava-phi3`.
+* `DESKTOP_AGENT_OCR=vlm` uses the vision-primitives OCR prompt against
+  `VISION_API_BASE`, `VISION_API_KEY`, and `VISION_MODEL`.
+
+Mouse, keyboard, focus, launch, and URL actions do nothing unless
+`VISION_ALLOW_SCREEN_CONTROL=1`. Leave it unset while you are reading the
+screen. Pass `dry_run=True` on a risky call to log the plan without moving the
+cursor.
+
+## Run the example
+
+```powershell
+$env:DESKTOP_AGENT_OCR = "tesseract"
+python -m desktop_agent.agents.example_loop "Read the title of the front window"
+```
+
+Or:
+
+```powershell
+.\scripts\run-example.ps1 "Read the title of the front window"
+```
+
+The loop captures the full screen, runs OCR, stores the observation, archives
+a summary when MilesMemory is installed, prints a stub reply, and issues one
+`mouse_click` with `dry_run=True`. It does not ask a remote model what to do.
+
+## Tests
+
+```powershell
+python -m pytest
+```
+
+The tests use fake grabbers and a fake input backend. They do not move the cursor.

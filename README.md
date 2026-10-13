@@ -13,6 +13,7 @@ existing MilesMemory server. It is not a copy of those trees.
 | Allowlist, dangerous-label gate, launch and focus | [dsh-computer-use](https://github.com/988hj7tczd-oss/dsh-computer-use) |
 | Settings lookup and the Ollama `read_text` OCR swap | [ollama-vision-mcp](https://github.com/xkiranj/ollama-vision-mcp) |
 | Image and video tools | [opencv-mcp-server](https://github.com/GongRzhe/opencv-mcp-server) — read, not ported; screen pixels stay in Pillow |
+| Window tools that do not steal focus | [PC-Control](https://github.com/VortexJer/PC-Control) `windows`, `look`, `click`, `type`, `drag`, `key`, `scroll`, `read`, `show`, `open_app` |
 | Long-term recall | [MilesMemory](https://github.com/Staerrz/MilesMemory) `memory_kb` |
 
 None of the four desktop repositories is a memory core. Observation snapshots
@@ -29,7 +30,8 @@ desktop_agent/
   memory/     MemoryManager
   vision/     full screen, region, active window, OCR, downsample
   control/    move_mouse, click, type_text, press, focus_window, launch_app, open_url
-  bridge/     the functions a model calls
+              pc_control/   PC-Control's own modules (not a second server)
+  bridge/     the functions a model calls, including pc_look, pc_click, ...
   agents/     one example loop
 scripts/      install and run notes
 ```
@@ -107,6 +109,31 @@ bridge tools. `open_url` accepts only `http://` and `https://`. Active-window
 capture is `desktop_agent.vision.capture.capture_active_window`.
 
 Swap OCR with `DESKTOP_AGENT_OCR=tesseract` (default), `ollama`, or `vlm`.
+
+PC-Control's ten tools are on this same bridge: `pc_windows`, `pc_look`,
+`pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`,
+`pc_open_app`. They call the PC-Control implementations (UI Automation, no
+`SetForegroundWindow`). They do not replace `mouse_click` or `keyboard_type`.
+Mutating ones honor `dry_run` and `VISION_ALLOW_SCREEN_CONTROL`. A protected
+window returns `needs_permission` and does not run; there is no confirm flag
+for the model. On Windows, `pip install -e ".[pc]"`.
+
+## Two processes, two bridges
+
+Miles Memory and this agent are not one server.
+
+| | Vision agent | Miles Memory |
+| --- | --- | --- |
+| Process | `desktop_agent` (this repo) | `python -m memory_kb` |
+| Port | none. The bridge is a Python import | `127.0.0.1:8765` (unchanged) |
+| Surface | `desktop_agent.bridge` | `https://<host>/mcp` or stdio |
+| Tools | screen, mouse, keyboard, and the `pc_*` window tools | `memory_recall`, `search_memories`, and the other `memory_kb` tools |
+| Registry | this process only | the memory process only |
+
+Nothing here vendors `memory_kb`, binds port 8765, or registers memory tools
+next to `pc_look`. `memory_search` on the vision bridge calls Miles Memory's
+library when it is installed. It does not mount Miles Memory's `/mcp` route.
+PC-Control is not started as `pc-control-mcp` or FastMCP `"PC-Control"`.
 
 ## Tests
 

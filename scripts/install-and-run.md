@@ -43,10 +43,24 @@ Optional OCR swaps:
 * `DESKTOP_AGENT_OCR=vlm` uses the vision-primitives OCR prompt against
   `VISION_API_BASE`, `VISION_API_KEY`, and `VISION_MODEL`.
 
-Mouse, keyboard, focus, launch, and URL actions do nothing unless
-`VISION_ALLOW_SCREEN_CONTROL=1`. Leave it unset while you are reading the
-screen. Pass `dry_run=True` on a risky call to log the plan without moving the
-cursor.
+Mouse, keyboard, focus, launch, URL, and the mutating PC-Control tools
+(`pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_show`,
+`pc_open_app`) do nothing unless `VISION_ALLOW_SCREEN_CONTROL=1`. Leave it
+unset while you are reading the screen. Pass `dry_run=True` on a risky call
+to log the plan without moving the cursor.
+
+PC-Control window tools (no focus steal) need the Windows extra:
+
+```powershell
+python -m pip install -e ".[pc]"
+```
+
+`pc_windows`, `pc_look`, and `pc_read` do not use that switch. They still
+follow `PC_CONTROL_MODE` and `~/.pc-control/PAUSE`.
+
+Miles Memory stays a second process. Start it the way that repo documents
+(`python -m memory_kb`, port `8765`, path `/mcp`). Do not point that port at
+this package, and do not run `pc-control-mcp`. This process has no MCP port.
 
 ## Run the example
 

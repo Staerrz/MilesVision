@@ -9,7 +9,7 @@ description = "Local Windows desktop agent: screen, OCR, mouse, keyboard, and Mi
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-dependencies = ["pillow>=10"]
+dependencies = ["pillow>=10", "mcp>=2"]
 
 [project.optional-dependencies]
 ocr = ["pytesseract>=0.3.10"]

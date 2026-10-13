@@ -166,14 +166,14 @@ Miles Memory stays its own process. This integration does not vendor `src/memory
 | | Vision agent | Miles Memory |
 | --- | --- | --- |
 | Process | `desktop_agent` in this repo | `python -m memory_kb` |
-| Port | none. The bridge is an in-process Python import | `127.0.0.1:8765`, unchanged |
-| Surface | `desktop_agent.bridge` | HTTP `/mcp` or stdio |
+| Port | `127.0.0.1:8770` for the PC listener. The in-process bridge has no port | `127.0.0.1:8765`, unchanged |
+| Surface | `http://127.0.0.1:8770/mcp` (`pc_*` only) and `desktop_agent.bridge` | HTTP `/mcp` or stdio |
 | Tools | screen, Win32 mouse and keyboard, and `pc_*` | `memory_recall`, `memory_save`, `memory_status`, `memory_associate`, `memory_forget`, `search_memories`, `create_memory`, `update_memory`, `delete_memory`, `get_memory_stats`, `get_timeline`, `get_episodic_memories`, `build_knowledge_index` |
 | Registry | this process only | the memory process only |
 
 `memory_search` on the vision bridge imports `memory_kb.engine.KnowledgeBase` when that package is installed beside this one. That is a library call. It is not Miles Memory's `/mcp` route, and the `pc_*` names are not registered in the memory server.
 
-PC-Control is not a third server. `pc-control-mcp` and FastMCP `"PC-Control"` are not started.
+`python -m pc_control.server`, run from `desktop_agent/control`, stays up as streamable HTTP at `http://127.0.0.1:8770/mcp`. `tools/list` returns only `pc_windows`, `pc_look`, `pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`, `pc_open_app`. Those calls go through `desktop_agent.bridge`, so `dry_run` and `VISION_ALLOW_SCREEN_CONTROL` are unchanged. This process does not bind `127.0.0.1:8765` and does not register Miles Memory tools. `pc-control-mcp` is still not the entry point.
 
 ## PC-Control
 
@@ -183,9 +183,10 @@ Read at `31113310f071af2eb09ee2c00faf807c8a5b1de4` (`claude-pc-control` 0.6.1). 
 
 | Source | Functions | New path | What happened |
 | --- | --- | --- | --- |
-| `pc_control/server.py` | `windows`, `look`, `click`, `type`, `drag`, `key`, `scroll`, `read`, `show`, `open_app`, plus helpers `_target`, `_by_name`, `_proc`, `_allowed`, `_paused`, `_gate`, `_category`, `_recheck_window`, `_live_name`, `_guard_element`, `_guard_point`, `_mine`, `_closing_guard`, `_key_guard`, `_dialog_default_risk`, `T_`, `_is_hidden`, `_on`, `_cursor_wanted`, `_screen_point`, `_layout_ok`, `notice_text`, `_ensure_layout`, `verdict`, `_tr`, `_tr_report`, `_act`, `_init_main`, `_clean_old_log`, `_shutdown`, `_watch_parent` | `desktop_agent/control/pc_control/server.py` | Rewritten at the edges. FastMCP `"PC-Control"`, `mcp.tool()`, pydantic `_Permission`, async `_ask_user`, MCP `Image`/`Context`, and `_slim_schemas` are gone. A local `ToolError` and `TOOLS` dict replace them. `@tool` stores the sync inner function. `look` image mode returns a path string instead of an MCP `Image` block. `main()` raises `RuntimeError` and does not call `mcp.run`, `_clean_old_log`, `_watch_parent`, or `_shutdown`. The ten tool bodies and the helpers are the source text. |
+| `pc_control/server.py` | `windows`, `look`, `click`, `type`, `drag`, `key`, `scroll`, `read`, `show`, `open_app`, plus helpers `_target`, `_by_name`, `_proc`, `_allowed`, `_paused`, `_gate`, `_category`, `_recheck_window`, `_live_name`, `_guard_element`, `_guard_point`, `_mine`, `_closing_guard`, `_key_guard`, `_dialog_default_risk`, `T_`, `_is_hidden`, `_on`, `_cursor_wanted`, `_screen_point`, `_layout_ok`, `notice_text`, `_ensure_layout`, `verdict`, `_tr`, `_tr_report`, `_act`, `_init_main`, `_clean_old_log`, `_shutdown`, `_watch_parent` | `desktop_agent/control/pc_control/server.py` | Rewritten at the edges. FastMCP `"PC-Control"`, `mcp.tool()`, pydantic `_Permission`, async `_ask_user`, MCP `Image`/`Context`, and `_slim_schemas` are gone. A local `ToolError` and `TOOLS` dict replace them. `@tool` stores the sync inner function. `look` image mode returns a path string instead of an MCP `Image` block. `main()` now calls `http_server.serve()` and stays up. It does not call `_clean_old_log`, `_watch_parent`, or `_shutdown`. The ten tool bodies and the helpers are the source text. |
 | `pc_control/server.py` ten tools | same names | `desktop_agent/bridge/api.py` `pc_windows`, `pc_look`, `pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`, `pc_open_app` | Merged onto the existing `Bridge._call` logger (timestamp, params, outcome). Module functions of the same names are re-exported from `desktop_agent/bridge/__init__.py`. `confirm` is not a bridge argument. |
-| `pc_control/__init__.py` | `__version__ = "0.6.1"` | `desktop_agent/control/pc_control/__init__.py` | Kept the version. The docstring now says this package does not start an MCP server. |
+| `pc_control/__init__.py` | `__version__ = "0.6.1"` | `desktop_agent/control/pc_control/__init__.py` | Kept the version. The docstring now points at `python -m pc_control.server` on `127.0.0.1:8770/mcp`. |
+| — | listener | `desktop_agent/control/pc_control/http_server.py` | New. Registers only the bridge `pc_*` functions and serves streamable HTTP. Not a copy of upstream `cli.py` or FastMCP `"PC-Control"`. |
 | `pc_control/actions.py` | `scroll`, `read_text`, `shortcut`, `select_option`, `find`, `scroll_into_view`, `select_in_parent`, `press_out_of_view` | `desktop_agent/control/pc_control/actions.py` | Kept. Unchanged from the source file. |
 | `pc_control/core.py` | `find_window`, `list_windows`, `grab`, `walk_uia`, `ocr_items`, `look`, `choose` | `desktop_agent/control/pc_control/core.py` | Kept. Unchanged. `SetProcessDpiAwareness` still runs at import, which is why the bridge imports this only when a call executes. |
 | `pc_control/cursor.py` | `render_arrow`, `render_caret`, `render_note`, `render_mark`, `mark_clicked` | `desktop_agent/control/pc_control/cursor.py` | Kept. Unchanged. This is PC-Control's orange overlay, not the Win32 cursor. |
@@ -247,6 +248,7 @@ These paths exist in the project:
 * `desktop_agent/control/window.py`
 * `desktop_agent/control/pc_control/__init__.py`
 * `desktop_agent/control/pc_control/server.py`
+* `desktop_agent/control/pc_control/http_server.py`
 * `desktop_agent/control/pc_control/actions.py`
 * `desktop_agent/control/pc_control/core.py`
 * `desktop_agent/control/pc_control/cursor.py`

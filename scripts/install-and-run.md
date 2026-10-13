@@ -60,7 +60,18 @@ follow `PC_CONTROL_MODE` and `~/.pc-control/PAUSE`.
 
 Miles Memory stays a second process. Start it the way that repo documents
 (`python -m memory_kb`, port `8765`, path `/mcp`). Do not point that port at
-this package, and do not run `pc-control-mcp`. This process has no MCP port.
+this package.
+
+The PC control listener is a third process, not a route on Miles Memory.
+From `desktop_agent\control`:
+
+```powershell
+python -m pc_control.server
+```
+
+It stays up at `http://127.0.0.1:8770/mcp`. `tools/list` returns `pc_windows`,
+`pc_look`, `pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`,
+`pc_show`, and `pc_open_app`.
 
 ## Run the example
 

@@ -6,7 +6,7 @@ The implementations are ``desktop_agent.control.pc_control.server.TOOLS``:
 they do not replace ``mouse_click``, ``keyboard_type``, ``mouse_drag``, or
 ``keyboard_hotkey``.
 
-There is no FastMCP server here. Miles Memory is not imported.
+Miles Memory is not imported. The HTTP listener is ``pc_control.server``.
 """
 
 from __future__ import annotations

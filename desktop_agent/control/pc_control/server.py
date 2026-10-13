@@ -36,7 +36,7 @@ MAIN = ThreadPoolExecutor(1, thread_name_prefix="pc-control-main", initializer=_
 
 
 def tool(fn):
-    """Keep the tool callable for the vision bridge. There is no second MCP server and no confirm flag for the model.
+    """Keep the tool callable for the vision bridge. There is no confirm flag for the model.
 
     A protected window raises policy.NeedsPermission. The vision bridge returns that question and does not run the action.
     The last unexpected error is still written to ~/.pc-control/last_error.log, then replaced, same as the source.
@@ -740,9 +740,17 @@ def _watch_parent():
     threading.Thread(target=wait, name="pc-control-parent", daemon=True).start()
 
 
-def main():
-    """Not a server. Models call desktop_agent.bridge, which calls TOOLS."""
-    raise RuntimeError(
-        "PC-Control tools are desktop_agent.bridge functions (pc_windows, pc_look, pc_click, ...). "
-        "This module does not start an MCP server."
-    )
+def main() -> None:
+    """Stay up as a streamable HTTP MCP server for the registered pc_* bridge tools.
+
+    Tool calls go through ``desktop_agent.bridge``, so ``dry_run`` and
+    ``VISION_ALLOW_SCREEN_CONTROL`` are unchanged. This does not bind Miles
+    Memory's port.
+    """
+    from .http_server import serve
+
+    serve()
+
+
+if __name__ == "__main__":
+    main()

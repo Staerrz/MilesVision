@@ -71,7 +71,11 @@ python -m pc_control.server
 
 It stays up at `http://127.0.0.1:8770/mcp` as stateless JSON. `Host:
 aetherbridge.a.pinggy.link` is accepted. An unauthenticated `POST /mcp` is
-401. Register, authorize, and exchange a code at `/token`, then send
+401, and `POST /token` before a code is 401. `GET /authorize` with
+`response_type=code`, PKCE S256, and
+`redirect_uri=https://sesameai.app/api/oauth/external-mcp/callback` returns
+200, the confirm page, even when that `client_id` was not registered with
+this process. Approve the page, then exchange the code at `/token`. Send
 `Authorization: Bearer` with `Content-Type: application/json` and `Accept:
 application/json`. `tools/list` returns `pc_windows`, `pc_look`, `pc_click`,
 `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`, and

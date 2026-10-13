@@ -105,6 +105,9 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         assert pinggy["token_route_status"] != 404
         assert pinggy["protected_resource_status"] == 200
         assert pinggy["tools"] == list(EXPECTED)
+        assert pinggy["sesame_authorize_status"] == 200
+        assert pinggy["sesame_token_before_code"] == 401
+        assert pinggy["sesame_access_token"]
         names, click, refused = asyncio.run(_listed_and_called(port, pinggy["access_token"]))
         assert names == list(EXPECTED)
         assert click["ok"] is True
@@ -246,10 +249,29 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
             "resource": DEFAULT_PUBLIC_ORIGIN,
         }
     )
-    authorize_status, authorize_headers, authorize_body = request("GET", f"/authorize?{query}")
-    if authorize_status != 302:
+    authorize_status, _authorize_headers, authorize_body = request("GET", f"/authorize?{query}")
+    if authorize_status != 200 or b"Allow" not in authorize_body:
         raise AssertionError(f"authorize {authorize_status}: {authorize_body!r}")
-    code = parse_qs(urlparse(authorize_headers["location"]).query)["code"][0]
+    approved_status, approved_headers, approved_body = request(
+        "POST",
+        "/authorize",
+        body=urlencode(
+            {
+                "response_type": "code",
+                "client_id": client["client_id"],
+                "redirect_uri": "http://127.0.0.1/callback",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": "miles",
+                "resource": DEFAULT_PUBLIC_ORIGIN,
+                "decision": "approve",
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if approved_status != 302:
+        raise AssertionError(f"approve {approved_status}: {approved_body!r}")
+    code = parse_qs(urlparse(approved_headers["location"]).query)["code"][0]
     issued_status, _issued_headers, issued_body = request(
         "POST",
         "/token",
@@ -283,6 +305,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     if listed_status != 200:
         raise AssertionError(f"tools/list {listed_status}: {listed_body!r}")
     listed = json.loads(listed_body.decode())
+    sesame = _sesame_unknown_client(request)
     www = unauthenticated_headers.get("www-authenticate", "")
     return {
         "unauthenticated_status": unauthenticated_status,
@@ -291,6 +314,102 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         "protected_resource_status": protected_status,
         "access_token": access_token,
         "tools": [tool["name"] for tool in listed["result"]["tools"]],
+        "sesame_authorize_status": sesame["authorize_status"],
+        "sesame_token_before_code": sesame["token_before_code"],
+        "sesame_access_token": sesame["access_token"],
+    }
+
+
+def _sesame_unknown_client(request) -> dict:
+    """The Sesame GET has no prior /register. It must be the confirm page, then a token."""
+    import base64
+    import hashlib
+    import json
+    import secrets
+    from urllib.parse import parse_qs, urlencode, urlparse
+
+    client_id = "fGTSoieUnojA4VEH36u1nRV5mBtM57E4"
+    redirect_uri = "https://sesameai.app/api/oauth/external-mcp/callback"
+    resource = "https://aetherbridge.a.pinggy.link/mcp"
+    state = "v1.gAAAA" + ("A" * 2048)
+    exact = urlencode(
+        {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": "GEjhW7wZVT6lHluVzSCg5wnCdezdydgbnLeptwitwW0",
+            "code_challenge_method": "S256",
+            "resource": resource,
+            "state": state,
+        }
+    )
+    page_status, _page_headers, page_body = request("GET", f"/authorize?{exact}")
+    if page_status != 200 or b"Allow" not in page_body or client_id.encode() not in page_body:
+        raise AssertionError(f"sesame authorize {page_status}: {page_body[:300]!r}")
+    if b"unknown client" in page_body.lower():
+        raise AssertionError(page_body[:300])
+
+    before_status, _before_headers, _before_body = request(
+        "POST",
+        "/token",
+        body=urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": "not-issued",
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": "a" * 64,
+                "resource": resource,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    approved_status, approved_headers, approved_body = request(
+        "POST",
+        "/authorize",
+        body=urlencode(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": resource,
+                "state": state,
+                "decision": "approve",
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if approved_status != 302:
+        raise AssertionError(f"sesame approve {approved_status}: {approved_body!r}")
+    code = parse_qs(urlparse(approved_headers["location"]).query)["code"][0]
+    if parse_qs(urlparse(approved_headers["location"]).query)["state"][0] != state:
+        raise AssertionError("state was dropped")
+    issued_status, _issued_headers, issued_body = request(
+        "POST",
+        "/token",
+        body=urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+                "resource": resource,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+    if issued_status != 200:
+        raise AssertionError(f"sesame token {issued_status}: {issued_body!r}")
+    return {
+        "authorize_status": page_status,
+        "token_before_code": before_status,
+        "access_token": json.loads(issued_body.decode())["access_token"],
     }
 
 

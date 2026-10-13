@@ -81,6 +81,7 @@ def build_server() -> Any:
     from .oauth import LocalDesktopOAuth, public_origin
 
     origin = public_origin()
+    provider = LocalDesktopOAuth()
     server = MCPServer(
         "desktop-agent-pc",
         auth=AuthSettings(
@@ -90,11 +91,37 @@ def build_server() -> Any:
             required_scopes=[],
             validate_token_resource=False,
         ),
-        auth_server_provider=LocalDesktopOAuth(),
+        auth_server_provider=provider,
     )
+    server.pc_oauth = provider
     for fn in registered_tools():
         server.add_tool(fn, structured_output=False)
     return server
+
+
+def _install_confirm_authorize(app: Any, provider: Any) -> None:
+    """Replace the SDK ``/authorize`` route with the confirm page.
+
+    The SDK handler answers an unknown ``client_id`` with 400 and redirects
+    immediately. Sesame opens ``/authorize`` for a client registered on another
+    process, and that GET has to be the confirm page.
+    """
+    from mcp.server.transport_security import DEFAULT_MAX_REQUEST_BODY_SIZE, RequestBodyLimitMiddleware
+    from starlette.routing import Route, request_response
+
+    from .oauth import ConfirmAuthorize
+
+    endpoint = RequestBodyLimitMiddleware(
+        request_response(ConfirmAuthorize(provider).handle),
+        DEFAULT_MAX_REQUEST_BODY_SIZE,
+    )
+    replacement = Route("/authorize", endpoint=endpoint, methods=["GET", "POST"])
+    routes = app.router.routes
+    for index, route in enumerate(routes):
+        if getattr(route, "path", None) == "/authorize":
+            routes[index] = replacement
+            return
+    raise RuntimeError("PC control listener is missing /authorize")
 
 
 def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
@@ -119,6 +146,7 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
         host=host,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
+    _install_confirm_authorize(app, server.pc_oauth)
     manager = server.session_manager
     if not manager.stateless or not manager.json_response:
         raise RuntimeError("PC control listener must be one stateless JSON session manager")

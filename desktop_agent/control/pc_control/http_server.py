@@ -79,19 +79,49 @@ def build_server() -> Any:
     return server
 
 
+def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
+    """One Starlette app, one ``StreamableHTTPSessionManager``, for the process.
+
+    ``streamable_http_app`` is called once. Its Starlette lifespan is that
+    manager's ``run()``, entered when uvicorn starts and left when it stops.
+    Requests do not build another manager.
+
+    ``stateless_http`` and ``json_response`` are on so a tunnel can POST
+    ``initialize`` and ``tools/list`` without a remembered ``mcp-session-id``.
+    A GET that still carries a stale id is not looked up, and therefore is
+    not answered 404.
+    """
+    server = build_server()
+    app = server.streamable_http_app(
+        streamable_http_path=path,
+        json_response=True,
+        stateless_http=True,
+        host=host,
+    )
+    manager = server.session_manager
+    if not manager.stateless or not manager.json_response:
+        raise RuntimeError("PC control listener must be one stateless JSON session manager")
+    app.state.pc_session_manager = manager
+    return app
+
+
 def serve(host: str = HOST, port: int | None = None, path: str = HTTP_PATH) -> None:
     """Block on the streamable HTTP listener."""
+    import uvicorn
+
     chosen = listen_port() if port is None else port
     if chosen == MEMORY_PORT:
         raise RuntimeError(
             "Port 8765 belongs to Miles Memory (127.0.0.1:8765 /mcp). "
             "The PC control listener will not bind it."
         )
-    server = build_server()
-    print(f"PC control MCP listening at http://{host}:{chosen}{path}", flush=True)
-    server.run(
-        "streamable-http",
-        host=host,
-        port=chosen,
-        streamable_http_path=path,
-    )
+    app = build_http_app(host=host, path=path)
+    message = f"PC control MCP listening at http://{host}:{chosen}{path}"
+    config = uvicorn.Config(app, host=host, port=chosen, log_level="info", lifespan="on")
+
+    class _Server(uvicorn.Server):
+        async def startup(self, sockets=None):  # type: ignore[no-untyped-def]
+            await super().startup(sockets=sockets)
+            print(message, flush=True)
+
+    _Server(config).run()

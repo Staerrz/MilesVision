@@ -173,9 +173,11 @@ Miles Memory stays its own process. This integration does not vendor `src/memory
 
 `memory_search` on the vision bridge imports `memory_kb.engine.KnowledgeBase` when that package is installed beside this one. That is a library call. It is not Miles Memory's `/mcp` route, and the `pc_*` names are not registered in the memory server.
 
-`python -m pc_control.server`, run from `desktop_agent/control`, stays up as streamable HTTP at `http://127.0.0.1:8770/mcp`. One `StreamableHTTPSessionManager` is created with the process and entered from the Starlette lifespan. The listener is stateless JSON: it does not issue `mcp-session-id`, and a GET that still carries a stale id is not answered 404. `tools/list` returns only `pc_windows`, `pc_look`, `pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`, `pc_open_app`. Those calls go through `desktop_agent.bridge`, so `dry_run` and `VISION_ALLOW_SCREEN_CONTROL` are unchanged. This process does not bind `127.0.0.1:8765` and does not register Miles Memory tools. `pc-control-mcp` is still not the entry point.
+`python -m pc_control.server`, run from `desktop_agent/control`, stays up as streamable HTTP at `http://127.0.0.1:8770/mcp`. One `StreamableHTTPSessionManager` is created with the process and entered from the Starlette lifespan. The listener is stateless JSON. DNS-rebinding protection is off, so `Host: aetherbridge.a.pinggy.link` is not a 421. OAuth stays on. Unauthenticated `POST /mcp` is 401 and `WWW-Authenticate` carries `resource_metadata="https://aetherbridge.a.pinggy.link/.well-known/oauth-protected-resource"` (`PC_CONTROL_PUBLIC_ORIGIN` overrides that origin). The same process serves `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize`, and `/token`. After a bearer token from `/token`, `tools/list` returns only `pc_windows`, `pc_look`, `pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`, `pc_open_app`. Those calls go through `desktop_agent.bridge`, so `dry_run` and `VISION_ALLOW_SCREEN_CONTROL` are unchanged. This process does not bind `127.0.0.1:8765` and does not register Miles Memory tools.
 
-The client POSTs to `http://127.0.0.1:8770/mcp` with `Content-Type: application/json` and `Accept: application/json`. `Host` is `127.0.0.1:8770`. The first body is JSON-RPC `initialize` (`protocolVersion` `2025-11-25`, `capabilities`, `clientInfo`). Then `notifications/initialized`. Then `tools/list`. Each POST is its own request. Do not send `mcp-session-id`; an old value is ignored. The response is one JSON body, not an SSE stream.
+```bash
+curl -sS -D - -o /dev/null -X POST http://127.0.0.1:8770/mcp -H "Host: aetherbridge.a.pinggy.link" -H "Content-Type: application/json" -H "Accept: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"miles\",\"version\":\"0\"}}}"
+```
 
 ## PC-Control
 
@@ -251,6 +253,7 @@ These paths exist in the project:
 * `desktop_agent/control/pc_control/__init__.py`
 * `desktop_agent/control/pc_control/server.py`
 * `desktop_agent/control/pc_control/http_server.py`
+* `desktop_agent/control/pc_control/oauth.py`
 * `desktop_agent/control/pc_control/actions.py`
 * `desktop_agent/control/pc_control/core.py`
 * `desktop_agent/control/pc_control/cursor.py`

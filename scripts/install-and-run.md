@@ -69,10 +69,11 @@ From `desktop_agent\control`:
 python -m pc_control.server
 ```
 
-It stays up at `http://127.0.0.1:8770/mcp` as stateless JSON. POST
-`initialize`, then `notifications/initialized`, then `tools/list`. Send
-`Content-Type: application/json` and `Accept: application/json`. Do not send
-`mcp-session-id`. `tools/list` returns `pc_windows`, `pc_look`, `pc_click`,
+It stays up at `http://127.0.0.1:8770/mcp` as stateless JSON. `Host:
+aetherbridge.a.pinggy.link` is accepted. An unauthenticated `POST /mcp` is
+401. Register, authorize, and exchange a code at `/token`, then send
+`Authorization: Bearer` with `Content-Type: application/json` and `Accept:
+application/json`. `tools/list` returns `pc_windows`, `pc_look`, `pc_click`,
 `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`, and
 `pc_open_app`.
 

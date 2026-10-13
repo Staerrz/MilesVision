@@ -65,15 +65,33 @@ def registered_tools() -> tuple[Callable[..., Any], ...]:
 
 
 def build_server() -> Any:
-    """An MCP server whose tools/list is exactly ``registered_tools``."""
+    """An MCP server whose tools/list is exactly ``registered_tools``.
+
+    OAuth stays on. Unauthenticated ``/mcp`` is 401. A bearer token from
+    ``/token`` is what ``tools/list`` accepts.
+    """
     try:
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
         from mcp.server.mcpserver import MCPServer
     except ImportError as exc:
         raise RuntimeError(
             "The PC control listener needs the mcp package (2.x). "
             "Install it with: python -m pip install 'mcp>=2'"
         ) from exc
-    server = MCPServer("desktop-agent-pc")
+    from .oauth import LocalDesktopOAuth, public_origin
+
+    origin = public_origin()
+    server = MCPServer(
+        "desktop-agent-pc",
+        auth=AuthSettings(
+            issuer_url=origin,
+            resource_server_url=origin,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+            required_scopes=[],
+            validate_token_resource=False,
+        ),
+        auth_server_provider=LocalDesktopOAuth(),
+    )
     for fn in registered_tools():
         server.add_tool(fn, structured_output=False)
     return server
@@ -86,17 +104,20 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
     manager's ``run()``, entered when uvicorn starts and left when it stops.
     Requests do not build another manager.
 
-    ``stateless_http`` and ``json_response`` are on so a tunnel can POST
-    ``initialize`` and ``tools/list`` without a remembered ``mcp-session-id``.
-    A GET that still carries a stale id is not looked up, and therefore is
-    not answered 404.
+    ``stateless_http`` and ``json_response`` stay on. DNS-rebinding protection
+    is off, the same way a tunneled host such as ``aetherbridge.a.pinggy.link``
+    is allowed through to Miles Memory: the SDK's localhost allow-list would
+    otherwise answer that Host with 421.
     """
+    from mcp.server.transport_security import TransportSecuritySettings
+
     server = build_server()
     app = server.streamable_http_app(
         streamable_http_path=path,
         json_response=True,
         stateless_http=True,
         host=host,
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
     manager = server.session_manager
     if not manager.stateless or not manager.json_response:

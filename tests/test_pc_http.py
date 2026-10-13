@@ -99,12 +99,13 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
                 break
         else:
             raise AssertionError(f"listener did not stay up: {output}")
-        stale = _stale_get_and_post_roundtrip(port)
-        assert stale["get_status"] != 404
-        assert stale["initialize_status"] == 200
-        assert "mcp-session-id" not in {name.lower() for name in stale["initialize_headers"]}
-        assert stale["tools"] == list(EXPECTED)
-        names, click, refused = asyncio.run(_listed_and_called(port))
+        pinggy = _pinggy_oauth_roundtrip(port)
+        assert pinggy["unauthenticated_status"] == 401
+        assert pinggy["www_authenticate_has_metadata"]
+        assert pinggy["token_route_status"] != 404
+        assert pinggy["protected_resource_status"] == 200
+        assert pinggy["tools"] == list(EXPECTED)
+        names, click, refused = asyncio.run(_listed_and_called(port, pinggy["access_token"]))
         assert names == list(EXPECTED)
         assert click["ok"] is True
         assert click["outcome"]["dry_run"] is True
@@ -120,24 +121,26 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
             proc.kill()
 
 
-async def _listed_and_called(port: int):
+async def _listed_and_called(port: int, access_token: str):
+    import httpx2
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamable_http_client
 
     url = f"http://{HOST}:{port}{HTTP_PATH}"
-    async with streamable_http_client(url) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            listed = await session.list_tools()
-            names = [tool.name for tool in listed.tools]
-            click = await session.call_tool(
-                "pc_click",
-                {"window": "Notepad", "target": "12", "dry_run": True},
-            )
-            refused = await session.call_tool(
-                "pc_open_app",
-                {"command": "notepad.exe", "dry_run": False},
-            )
+    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {access_token}"}) as http_client:
+        async with streamable_http_client(url, http_client=http_client) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                names = [tool.name for tool in listed.tools]
+                click = await session.call_tool(
+                    "pc_click",
+                    {"window": "Notepad", "target": "12", "dry_run": True},
+                )
+                refused = await session.call_tool(
+                    "pc_open_app",
+                    {"command": "notepad.exe", "dry_run": False},
+                )
     return names, _payload(click), _payload(refused)
 
 
@@ -154,39 +157,31 @@ def _payload(result) -> dict:
     return json.loads(text)
 
 
-def _stale_get_and_post_roundtrip(port: int) -> dict:
-    """A tunnel GET may still carry a session id this process never issued."""
+def _pinggy_oauth_roundtrip(port: int) -> dict:
+    """Host aetherbridge.a.pinggy.link must be 401 on /mcp, not 421, and /token must exist."""
+    import base64
+    import hashlib
     import http.client
     import json
+    import secrets
+    from urllib.parse import parse_qs, urlencode, urlparse
 
-    stale_id = "e4a70d315b7f4ea48a9f7291e752d2d7"
-    host = f"{HOST}:{port}"
-    connection = http.client.HTTPConnection(HOST, port, timeout=5)
-    try:
-        connection.request(
-            "GET",
-            HTTP_PATH,
-            headers={
-                "Host": host,
-                "Accept": "application/json, text/event-stream",
-                "mcp-session-id": stale_id,
-            },
-        )
-        get_response = connection.getresponse()
-        get_status = get_response.status
-    finally:
-        connection.close()
+    from desktop_agent.control.pc_control.oauth import DEFAULT_PUBLIC_ORIGIN, resource_metadata_url
 
-    def post(body: dict, extra_headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
+    tunnel_host = "aetherbridge.a.pinggy.link"
+    metadata = resource_metadata_url(DEFAULT_PUBLIC_ORIGIN)
+
+    def request(
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, str], bytes]:
         posted = http.client.HTTPConnection(HOST, port, timeout=5)
-        headers = {
-            "Host": host,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if extra_headers:
-            headers.update(extra_headers)
-        posted.request("POST", HTTP_PATH, body=json.dumps(body).encode(), headers=headers)
+        sent = {"Host": tunnel_host}
+        if headers:
+            sent.update(headers)
+        posted.request(method, path, body=body, headers=sent)
         response = posted.getresponse()
         status = response.status
         header_map = {name.lower(): value for name, value in response.getheaders()}
@@ -194,32 +189,107 @@ def _stale_get_and_post_roundtrip(port: int) -> dict:
         posted.close()
         return status, header_map, raw
 
-    initialize_status, initialize_headers, initialize_body = post(
+    unauthenticated_status, unauthenticated_headers, _raw = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "miles", "version": "0"},
+                },
+            }
+        ).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    token_route_status, _token_headers, _token_raw = request(
+        "POST",
+        "/token",
+        body=b"",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    protected_status, _protected_headers, protected_body = request("GET", "/.well-known/oauth-protected-resource")
+    if protected_status != 200:
+        raise AssertionError(f"protected resource {protected_status}: {protected_body!r}")
+
+    registered_status, _registered_headers, registered_body = request(
+        "POST",
+        "/register",
+        body=json.dumps(
+            {
+                "redirect_uris": ["http://127.0.0.1/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "client_secret_post",
+                "client_name": "miles",
+            }
+        ).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    if registered_status != 201:
+        raise AssertionError(f"register {registered_status}: {registered_body!r}")
+    client = json.loads(registered_body.decode())
+    verifier = secrets.token_urlsafe(32)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    query = urlencode(
         {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": {"name": "miles", "version": "0"},
-            },
+            "response_type": "code",
+            "client_id": client["client_id"],
+            "redirect_uri": "http://127.0.0.1/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "miles",
+            "resource": DEFAULT_PUBLIC_ORIGIN,
         }
     )
-    post({"jsonrpc": "2.0", "method": "notifications/initialized"})
-    listed_status, _listed_headers, listed_body = post(
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        {"mcp-session-id": stale_id, "mcp-protocol-version": "2025-11-25"},
+    authorize_status, authorize_headers, authorize_body = request("GET", f"/authorize?{query}")
+    if authorize_status != 302:
+        raise AssertionError(f"authorize {authorize_status}: {authorize_body!r}")
+    code = parse_qs(urlparse(authorize_headers["location"]).query)["code"][0]
+    issued_status, _issued_headers, issued_body = request(
+        "POST",
+        "/token",
+        body=urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://127.0.0.1/callback",
+                "client_id": client["client_id"],
+                "client_secret": client["client_secret"],
+                "code_verifier": verifier,
+                "resource": DEFAULT_PUBLIC_ORIGIN,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+    if issued_status != 200:
+        raise AssertionError(f"token {issued_status}: {issued_body!r}")
+    access_token = json.loads(issued_body.decode())["access_token"]
+    listed_status, _listed_headers, listed_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "mcp-protocol-version": "2025-11-25",
+        },
     )
     if listed_status != 200:
-        raise AssertionError(f"tools/list status {listed_status}: {listed_body!r}")
+        raise AssertionError(f"tools/list {listed_status}: {listed_body!r}")
     listed = json.loads(listed_body.decode())
-    if initialize_status != 200:
-        raise AssertionError(f"initialize status {initialize_status}: {initialize_body!r}")
+    www = unauthenticated_headers.get("www-authenticate", "")
     return {
-        "get_status": get_status,
-        "initialize_status": initialize_status,
-        "initialize_headers": list(initialize_headers),
+        "unauthenticated_status": unauthenticated_status,
+        "www_authenticate_has_metadata": f'resource_metadata="{metadata}"' in www,
+        "token_route_status": token_route_status,
+        "protected_resource_status": protected_status,
+        "access_token": access_token,
         "tools": [tool["name"] for tool in listed["result"]["tools"]],
     }
 

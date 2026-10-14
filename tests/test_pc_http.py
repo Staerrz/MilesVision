@@ -11,10 +11,10 @@ import time
 from pathlib import Path
 
 from desktop_agent.bridge.pc import SOURCE_NAMES
-from desktop_agent.control.pc_control.http_server import HOST, HTTP_PATH, PORT, registered_tools
+from desktop_agent.control.pc_control.http_server import HOST, HTTP_PATH, PORT, listed_names, registered_tools
 
 CONTROL = Path(__file__).resolve().parents[1] / "desktop_agent" / "control"
-EXPECTED = tuple(f"pc_{name}" for name in SOURCE_NAMES)
+EXPECTED = listed_names()
 
 
 def test_one_session_manager_for_the_process_lifespan() -> None:
@@ -39,9 +39,14 @@ def test_one_session_manager_for_the_process_lifespan() -> None:
 
 def test_registered_names_match_the_bridge() -> None:
     names = tuple(fn.__name__ for fn in registered_tools())
-    assert names == EXPECTED
+    assert names == tuple(f"pc_{name}" for name in SOURCE_NAMES)
+    assert listed_names()[: len(SOURCE_NAMES)] == tuple(SOURCE_NAMES)
+    assert "click" in listed_names()
+    assert "type" in listed_names()
+    assert "pc_click" in listed_names()
+    assert "mouse_click" not in listed_names()
+    assert "keyboard_type" not in listed_names()
     assert "memory_recall" not in names
-    assert "mouse_click" not in names
 
 
 def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
@@ -121,11 +126,11 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         assert "VISION_ALLOW_SCREEN_CONTROL" in refused["outcome"]["reason"]
         rest = _drain(proc)
         log = output + rest
-        assert "tools/call pc_click" in rest
+        assert "tools/call click" in rest
         assert "Terminating session: None" not in log
         ended = log.find("Terminating session:")
         if ended != -1:
-            assert ended > log.find("tools/call pc_click")
+            assert ended > log.find("tools/call click")
         assert proc.poll() is None
     finally:
         proc.terminate()
@@ -148,11 +153,11 @@ async def _listed_and_called(port: int, access_token: str):
                 listed = await session.list_tools()
                 names = [tool.name for tool in listed.tools]
                 click = await session.call_tool(
-                    "pc_click",
+                    "click",
                     {"window": "Notepad", "target": "12", "dry_run": True},
                 )
                 refused = await session.call_tool(
-                    "pc_open_app",
+                    "open_app",
                     {"command": "notepad.exe", "dry_run": False},
                 )
     return names, _payload(click), _payload(refused)
@@ -353,14 +358,15 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     if listed_body.startswith(b"event:") or listed_body.startswith(b":"):
         raise AssertionError(f"tools/list was SSE: {listed_body[:200]!r}")
     listed = json.loads(listed_body.decode())
-    from desktop_agent.bridge import api as bridge_api
-    from desktop_agent.control.pc_control.http_server import argument_schema, tool_description
+    from desktop_agent.control.pc_control.http_server import argument_schema, bridge_callable, tool_description
 
     by_name = {tool["name"]: tool for tool in listed["result"]["tools"]}
     for name in EXPECTED:
         tool = by_name[name]
+        if not tool.get("title") or not tool.get("description") or not tool.get("inputSchema"):
+            raise AssertionError(f"{name} missing title, description, or inputSchema: {tool!r}")
         schema = tool.get("inputSchema")
-        fn = getattr(bridge_api, name)
+        fn = bridge_callable(name)
         expected = argument_schema(fn)
         if schema != expected:
             raise AssertionError(f"{name} inputSchema {schema!r} != {expected!r}")
@@ -385,7 +391,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "pc_click",
+                    "name": "click",
                     "arguments": {"window": "Notepad", "target": "12", "dry_run": True, "confirm": False},
                 },
             }
@@ -402,6 +408,24 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     called_text = json.dumps(called)
     if "dry_run" not in called_text or called.get("error"):
         raise AssertionError(f"tools/call did not reach the bridge: {called!r}")
+    alias_status, _alias_headers, alias_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "pc_click",
+                    "arguments": {"window": "Notepad", "target": "12", "dry_run": True},
+                },
+            }
+        ).encode(),
+        headers=with_session,
+    )
+    if alias_status != 200 or b"dry_run" not in alias_body:
+        raise AssertionError(f"pc_click alias {alias_status}: {alias_body!r}")
     modern_status, modern_headers, modern_body = request(
         "POST",
         HTTP_PATH,
@@ -548,7 +572,7 @@ def _drain(proc: subprocess.Popen[str]) -> str:
         try:
             line = proc.stdout.readline()
         except BlockingIOError:
-            if "tools/call pc_click" in "".join(chunks):
+            if "tools/call click" in "".join(chunks):
                 break
             time.sleep(0.05)
             continue

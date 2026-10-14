@@ -49,7 +49,8 @@ def registered_tools() -> tuple[Callable[..., Any], ...]:
     """The bridge callables whose names are ``pc_`` plus each ``SOURCE_NAMES`` entry.
 
     Nothing else is registered. Screen, mouse, keyboard, and Miles Memory tools
-    stay off this listener.
+    stay off this listener. MCP ``tools/list`` publishes these under the
+    original short names (``click``, ``type``, ...) and keeps ``pc_*`` as aliases.
     """
     ensure_repo_on_path()
     from desktop_agent.bridge import api as bridge_api
@@ -65,14 +66,50 @@ def registered_tools() -> tuple[Callable[..., Any], ...]:
     return tuple(tools)
 
 
+def listed_names() -> tuple[str, ...]:
+    """Names ``tools/list`` returns.
+
+    The original PC-Control names come first, so a toolkit trigger for
+    ``click`` or ``type`` matches. ``pc_*`` follows as an alias of the same
+    function, so a client that still looks up ``pc_click`` does not miss it.
+    ``mouse_click`` and ``keyboard_type`` are not in this list.
+    """
+    from desktop_agent.bridge.pc import SOURCE_NAMES
+
+    short = tuple(SOURCE_NAMES)
+    return short + tuple(f"pc_{name}" for name in short)
+
+
+def bridge_callable(listed_name: str) -> Callable[..., Any]:
+    """The ``pc_*`` bridge function a listed MCP name runs."""
+    source = listed_name[3:] if listed_name.startswith("pc_") else listed_name
+    for fn in registered_tools():
+        if fn.__name__ == f"pc_{source}":
+            return fn
+    raise RuntimeError(f"{listed_name} is not a PC control tool")
+
+
 # What the model reads. The first sentence is the exact argument names.
 # ``confirm`` is a PC-Control parameter this bridge does not accept, so it is
 # not listed and not added to the schema.
+_TITLES: dict[str, str] = {
+    "windows": "Windows",
+    "look": "Look",
+    "click": "Click",
+    "type": "Type",
+    "drag": "Drag",
+    "key": "Key",
+    "scroll": "Scroll",
+    "read": "Read",
+    "show": "Show",
+    "open_app": "Open app",
+}
+
 _TOOL_TEXT: dict[str, str] = {
     "pc_windows": "List open windows as hwnd, process, and title, most recent first. filter matches the title or process. Empty lists every window.",
     "pc_look": "See a window without focusing it. window is a title substring or hwnd. mode defaults to auto. find limits the elements, including those out of view. wait is seconds to poll.",
-    "pc_click": "Click an element id from pc_look, its exact name, or x,y pixels of the last image. right and double default to false. dry_run true returns the plan and does not change the screen.",
-    "pc_type": "Type into an element id from pc_look, or its name. replace true replaces the current text. dry_run true returns the plan and does not change the screen.",
+    "pc_click": "Click an element id from look, its exact name, or x,y pixels of the last image. right and double default to false. dry_run true returns the plan and does not change the screen.",
+    "pc_type": "Type into an element id from look, or its name. replace true replaces the current text. dry_run true returns the plan and does not change the screen.",
     "pc_drag": "Drag through image points. shape defaults to path. right defaults to false. dry_run true returns the plan and does not change the screen.",
     "pc_key": "Send a key or the app's own shortcut. name is enter, tab, esc, arrows, or a shortcut such as ctrl+s. dry_run true returns the plan and does not change the screen.",
     "pc_scroll": "Scroll the window or an element id. direction defaults to down. amount defaults to 1. dry_run true returns the plan and does not change the screen.",
@@ -88,21 +125,21 @@ _ARGUMENT_TEXT: dict[str, dict[str, str]] = {
         "filter": "Text matched against the window title or process. Empty lists every window.",
     },
     "pc_look": {
-        "window": "Window title substring or hwnd from pc_windows.",
+        "window": "Window title substring or hwnd from windows.",
         "mode": "How to look. Default auto.",
         "find": "Element text to locate. Empty returns the whole look.",
         "wait": "Seconds to poll while finding. Default 0.",
     },
     "pc_click": {
         "window": "Window title substring or hwnd.",
-        "target": "Element id from pc_look.",
+        "target": "Element id from look.",
         "right": "Right click. Default false.",
         "double": "Double click. Default false.",
         "dry_run": "When true, return the plan and do not change the screen.",
     },
     "pc_type": {
         "window": "Window title substring or hwnd.",
-        "target": "Element id from pc_look.",
+        "target": "Element id from look.",
         "text": "Text to type into that element.",
         "replace": "Replace the element's current text. Default false.",
         "dry_run": "When true, return the plan and do not change the screen.",
@@ -206,16 +243,16 @@ def _json_type_name(annotation: Any) -> str:
     return "string"
 
 
-def _visible_call(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Log ``tools/call <name>`` on uvicorn's logger so it shows in the server terminal."""
+def _visible_call(fn: Callable[..., Any], listed_name: str) -> Callable[..., Any]:
+    """Log ``tools/call <listed name>`` so it shows in the server terminal."""
     import logging
 
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        logging.getLogger("uvicorn.error").info("tools/call %s", fn.__name__)
-        print(f"tools/call {fn.__name__}", flush=True)
+        logging.getLogger("uvicorn.error").info("tools/call %s", listed_name)
+        print(f"tools/call {listed_name}", flush=True)
         return fn(*args, **kwargs)
 
-    wrapped.__name__ = fn.__name__
+    wrapped.__name__ = listed_name
     wrapped.__doc__ = fn.__doc__
     wrapped.__annotations__ = dict(getattr(fn, "__annotations__", {}))
     wrapped.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
@@ -281,13 +318,26 @@ def build_server() -> Any:
         auth_server_provider=provider,
     )
     server.pc_oauth = provider
-    for fn in registered_tools():
-        server.add_tool(_visible_call(fn), structured_output=False)
-        tool = server._tool_manager.get_tool(fn.__name__)
+    for listed_name in listed_names():
+        fn = bridge_callable(listed_name)
+        source = listed_name[3:] if listed_name.startswith("pc_") else listed_name
+        title = _TITLES[source]
+        description = tool_description(fn)
+        server.add_tool(
+            _visible_call(fn, listed_name),
+            name=listed_name,
+            title=title,
+            description=description,
+            structured_output=False,
+        )
+        tool = server._tool_manager.get_tool(listed_name)
         if tool is None:
-            raise RuntimeError(f"{fn.__name__} was not registered")
+            raise RuntimeError(f"{listed_name} was not registered")
         tool.parameters = argument_schema(fn)
-        tool.description = tool_description(fn)
+        tool.description = description
+        tool.title = title
+        if not tool.name or not tool.title or not tool.description or not tool.parameters.get("properties"):
+            raise RuntimeError(f"{listed_name} is missing name, title, description, or inputSchema")
     _advertise_tools_only(server)
     return server
 

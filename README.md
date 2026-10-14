@@ -131,9 +131,7 @@ page, including a client id that was registered on another process.
 `redirect_uri` `https://sesameai.app/api/oauth/external-mcp/callback` and a
 long `state` are accepted. Approving that page, then `POST /token` with the
 matching PKCE verifier, returns an access token. `POST /token` before a code
-stays 401. With the bearer token, `initialize` returns `capabilities.tools` as `{}`. `tools/list` is JSON, with `name`, `description`, and `inputSchema` for `pc_windows`, `pc_look`,
-`pc_click`, `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`,
-`pc_show`, and `pc_open_app`. Calls still go through `desktop_agent.bridge`.
+stays 401. With the bearer token, `initialize` returns `capabilities.tools` as `{}`. `tools/list` is JSON. Each tool has `name`, `title`, `description`, and `inputSchema`. The names are `windows`, `look`, `click`, `type`, `drag`, `key`, `scroll`, `read`, `show`, and `open_app`, plus the `pc_*` aliases of those same functions. A trigger for `click` or `type` resolves to the PC-Control implementation. Calls still go through `desktop_agent.bridge`.
 
 ## Two processes, two bridges
 

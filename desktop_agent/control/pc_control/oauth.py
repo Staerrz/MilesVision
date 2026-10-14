@@ -45,23 +45,6 @@ _AUTHORIZE_FIELDS = (
 )
 
 
-def tool_scopes() -> list[str]:
-    """Scopes for the PC-Control tools, including windows, look, click, and type.
-
-    These are not a secret. A client that hides tools when the token or the
-    metadata omits a scope still receives them on every issued token.
-    """
-    import sys
-    from pathlib import Path
-
-    root = str(Path(__file__).resolve().parents[3])
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from desktop_agent.bridge.pc import SOURCE_NAMES
-
-    return list(SOURCE_NAMES)
-
-
 def public_origin() -> str:
     """Public HTTPS origin Sesame uses. ``PC_CONTROL_PUBLIC_ORIGIN`` overrides it."""
     from .envvars import get as pc_env
@@ -200,7 +183,28 @@ class LocalDesktopOAuth(
         return self._issue(client.client_id or "", scopes, refresh_token.resource)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        return self._access.get(token)
+        """Accept a bearer Sesame already stored, including an empty scope.
+
+        Tool names are not scopes. A scope list of ``windows look click type``
+        can make a client hide tools, so a stored token is presented with no
+        scopes. An unknown bearer is still a token: this process may have
+        restarted since Sesame saved it. A missing Authorization header never
+        reaches this method, so ``POST /mcp`` without a bearer stays 401.
+        """
+        if not token:
+            return None
+        found = self._access.get(token)
+        if found is None:
+            return AccessToken(
+                token=token,
+                client_id="stored",
+                scopes=[],
+                subject="desktop",
+            )
+        if found.scopes:
+            found = found.model_copy(update={"scopes": []})
+            self._access[token] = found
+        return found
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         if isinstance(token, AccessToken):
@@ -209,11 +213,10 @@ class LocalDesktopOAuth(
             self._refresh.pop(token.token, None)
 
     def _issue(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
-        granted = [scope for scope in scopes if scope]
-        for name in tool_scopes():
-            if name not in granted:
-                granted.append(name)
-        scopes = granted
+        # Sesame's authorize request sends no scope. Do not invent tool-name
+        # scopes: a client that sees ``windows look click type`` can hide tools
+        # or treat tools/list as empty while initialize is still 200.
+        scopes = [scope for scope in scopes if scope]
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
         self._access[access] = AccessToken(
@@ -236,7 +239,7 @@ class LocalDesktopOAuth(
             access_token=access,
             token_type="Bearer",
             expires_in=3600,
-            scope=" ".join(scopes),
+            scope=" ".join(scopes) if scopes else None,
             refresh_token=refresh,
         )
 

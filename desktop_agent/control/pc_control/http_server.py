@@ -246,12 +246,9 @@ def _json_type_name(annotation: Any) -> str:
 
 
 def _visible_call(fn: Callable[..., Any], listed_name: str) -> Callable[..., Any]:
-    """Log ``tools/call <listed name>`` so it shows in the server terminal."""
-    import logging
+    """Run the bridge tool. The HTTP listener logs ``tools/call`` once."""
 
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        logging.getLogger("uvicorn.error").info("tools/call %s", listed_name)
-        print(f"tools/call {listed_name}", flush=True)
         return fn(*args, **kwargs)
 
     wrapped.__name__ = listed_name
@@ -303,22 +300,17 @@ def build_server() -> Any:
             "Install it with: python -m pip install 'mcp>=2'"
         ) from exc
     from . import __version__
-    from .oauth import LocalDesktopOAuth, public_origin, tool_scopes
+    from .oauth import LocalDesktopOAuth, public_origin
 
     origin = public_origin()
     provider = LocalDesktopOAuth()
-    scopes = tool_scopes()
     server = MCPServer(
         "desktop-agent-pc",
         version=__version__,
         auth=AuthSettings(
             issuer_url=origin,
             resource_server_url=origin,
-            client_registration_options=ClientRegistrationOptions(
-                enabled=True,
-                valid_scopes=scopes,
-                default_scopes=scopes,
-            ),
+            client_registration_options=ClientRegistrationOptions(enabled=True),
             required_scopes=[],
             validate_token_resource=False,
         ),
@@ -372,42 +364,6 @@ def _install_confirm_authorize(app: Any, provider: Any) -> None:
             routes[index] = replacement
             return
     raise RuntimeError("PC control listener is missing /authorize")
-
-
-def _install_tool_scope_metadata(app: Any) -> None:
-    """Publish tool scopes on the protected-resource document.
-
-    The SDK copies ``required_scopes`` into that document. Those stay empty so
-    a bearer token is not turned into 403. The document itself still lists
-    ``windows``, ``look``, ``click``, and ``type`` so a client does not treat
-    the tool permission set as omitted.
-    """
-    from urllib.parse import urlparse
-
-    from mcp.server.auth.handlers.metadata import ProtectedResourceMetadataHandler
-    from mcp.server.auth.routes import build_resource_metadata_url, cors_middleware
-    from mcp.shared.auth import ProtectedResourceMetadata
-    from pydantic import AnyHttpUrl
-    from starlette.routing import Route
-
-    from .oauth import public_origin, tool_scopes
-
-    origin = AnyHttpUrl(public_origin())
-    metadata = ProtectedResourceMetadata(
-        resource=origin,
-        authorization_servers=[origin],
-        scopes_supported=tool_scopes(),
-        resource_name="PC control",
-    )
-    endpoint = cors_middleware(ProtectedResourceMetadataHandler(metadata).handle, ["GET", "OPTIONS"])
-    path = urlparse(str(build_resource_metadata_url(origin))).path
-    replacement = Route(path, endpoint=endpoint, methods=["GET", "OPTIONS"])
-    routes = app.router.routes
-    for index, route in enumerate(routes):
-        if getattr(route, "path", None) == path:
-            routes[index] = replacement
-            return
-    routes.insert(0, replacement)
 
 
 def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> str | None:
@@ -468,44 +424,6 @@ def _drop_accepted_origin(scope: dict[str, Any]) -> dict[str, Any]:
     return scope
 
 
-class _AdvertiseToolScopes:
-    """Tell a client which tool scopes to request.
-
-    ``WWW-Authenticate`` on 401 otherwise has no ``scope``. A client then
-    treats the protected-resource list as empty and can hide tools after a
-    200 initialize. Unauthenticated ``POST /mcp`` stays 401.
-    """
-
-    def __init__(self, app: Any) -> None:
-        self.app = app
-
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        async def send_challenge(message: dict[str, Any]) -> None:
-            if message.get("type") == "http.response.start" and message.get("status") == 401:
-                message = dict(message)
-                message["headers"] = _with_tool_scope(list(message.get("headers") or []))
-            await send(message)
-
-        await self.app(scope, receive, send_challenge)
-
-
-def _with_tool_scope(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
-    from .oauth import tool_scopes
-
-    parameter = f'scope="{" ".join(tool_scopes())}"'.encode()
-    updated: list[tuple[bytes, bytes]] = []
-    found = False
-    for key, value in headers:
-        if key.lower() == b"www-authenticate":
-            found = True
-            if b"scope=" not in value:
-                value = value + b", " + parameter
-        updated.append((key, value))
-    if not found:
-        updated.append((b"www-authenticate", b"Bearer " + parameter))
-    return updated
-
-
 class _PassthroughAcceptedOrigin:
     """Run before auth and the SDK transport.
 
@@ -528,22 +446,151 @@ def _live_session_id(manager: Any) -> str | None:
     return next(reversed(instances))
 
 
-# Handshake revisions return ``Mcp-Session-Id``. ``2026-07-28`` is a stateless
-# one-shot and does not, so a client that already listed tools never posts
-# ``tools/call``.
+# Handshake revisions return ``Mcp-Session-Id``. ``2026-07-28`` is served on
+# that session when the body is classic JSON-RPC, and the initialize result
+# names the version the client sent. Forcing the result down to ``2025-11-25``
+# is what makes a client skip tool loading.
 _HANDSHAKE_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"})
+_PROTOCOL_META = "io.modelcontextprotocol/protocolVersion"
+
+
+def _log_mcp(line: str) -> None:
+    """One line in the Uvicorn window for startup or a POST method."""
+    import logging
+
+    print(line, flush=True)
+    logging.getLogger("uvicorn.error").info("%s", line)
+
+
+def _jsonrpc(body: bytes) -> dict[str, Any] | None:
+    import json
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _modern_envelope(payload: dict[str, Any]) -> bool:
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return False
+    meta = params.get("_meta")
+    return isinstance(meta, dict) and _PROTOCOL_META in meta
+
+
+def _requested_protocol(headers: list[tuple[bytes, bytes]], payload: dict[str, Any] | None) -> str | None:
+    """The protocol version the client sent, body first, then the header."""
+    if payload:
+        params = payload.get("params")
+        if isinstance(params, dict):
+            version = params.get("protocolVersion")
+            if isinstance(version, str) and version:
+                return version
+            meta = params.get("_meta")
+            if isinstance(meta, dict):
+                stamped = meta.get(_PROTOCOL_META)
+                if isinstance(stamped, str) and stamped:
+                    return stamped
+    return _header(headers, b"mcp-protocol-version")
+
+
+def _tool_catalog() -> list[dict[str, Any]]:
+    """Every registered tool. Scope is not consulted."""
+    catalog: list[dict[str, Any]] = []
+    for name in listed_names():
+        fn = bridge_callable(name)
+        source = name[3:] if name.startswith("pc_") else name
+        catalog.append(
+            {
+                "name": name,
+                "title": _TITLES[source],
+                "description": tool_description(fn),
+                "inputSchema": argument_schema(fn),
+            }
+        )
+    return catalog
+
+
+def _echo_client_protocol(body: bytes, version: str) -> bytes:
+    """Put the client's protocol version on initialize, and keep tools advertised."""
+    import json
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return body
+    result["protocolVersion"] = version
+    capabilities = result.get("capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+        result["capabilities"] = capabilities
+    if not isinstance(capabilities.get("tools"), dict):
+        capabilities["tools"] = {}
+    if version not in _HANDSHAKE_VERSIONS:
+        result["resultType"] = "complete"
+    return json.dumps(payload).encode()
+
+
+async def _read_body(receive: Any) -> tuple[bytes, list[dict[str, Any]]]:
+    messages: list[dict[str, Any]] = []
+    chunks: list[bytes] = []
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message.get("type") != "http.request":
+            break
+        chunk = message.get("body") or b""
+        chunks.append(chunk if isinstance(chunk, bytes) else bytes(chunk))
+        if not message.get("more_body", False):
+            break
+    return b"".join(chunks), messages
+
+
+def _replay(messages: list[dict[str, Any]]) -> Any:
+    pending = list(messages)
+
+    async def receive() -> dict[str, Any]:
+        if pending:
+            return pending.pop(0)
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+async def _send_json(send: Any, body: bytes, session: str | None) -> None:
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode()),
+    ]
+    if session:
+        headers.append((b"mcp-session-id", session.encode("ascii")))
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": _expose_session_id(headers),
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 def _keep_process_session(manager: Any, path: str) -> None:
     """Keep the session initialize created, and return its id.
 
-    ``initialize`` answers with ``Mcp-Session-Id``. That id stays valid after
-    ``tools/list``. A later ``tools/call`` that sends it is handled. A POST
-    with no session id is attached to the same session. A protocol version
-    that would take the stateless path is served on the handshake path so the
-    response still carries the id. A stale id from an earlier process is
-    dropped only when this process has no session yet, so initialize can open
-    one instead of answering 404.
+    ``initialize`` answers with ``Mcp-Session-Id`` and the protocol version
+    the client sent. ``tools/list`` returns every registered tool and is not
+    filtered by token scope. A later ``tools/call`` that sends the session id
+    is handled. A POST with no session id is attached to the same session.
+    A classic JSON-RPC body is served on the handshake session so a modern
+    header does not skip tool loading. A stale id from an earlier process is
+    dropped only when this process has no session yet.
     """
     original = manager.asgi_app
 
@@ -554,9 +601,43 @@ def _keep_process_session(manager: Any, path: str) -> None:
                 return
             scope = _drop_accepted_origin(scope)
             headers = list(scope.get("headers") or [])
-            version = _header(headers, b"mcp-protocol-version")
-            if version is not None and version not in _HANDSHAKE_VERSIONS:
-                headers = _set_header(headers, b"mcp-protocol-version", b"2025-11-25")
+            body = b""
+            replay = receive
+            payload: dict[str, Any] | None = None
+            if scope.get("method") == "POST":
+                body, messages = await _read_body(receive)
+                replay = _replay(messages)
+                payload = _jsonrpc(body)
+            requested = _requested_protocol(headers, payload)
+            method = payload.get("method") if payload else None
+            if method == "tools/list":
+                catalog = _tool_catalog()
+                _log_mcp(f"tools/list {len(catalog)}")
+                import json
+
+                result: dict[str, Any] = {"tools": catalog}
+                if requested and requested not in _HANDSHAKE_VERSIONS:
+                    result["resultType"] = "complete"
+                encoded = json.dumps(
+                    {"jsonrpc": "2.0", "id": payload.get("id") if payload else None, "result": result}
+                ).encode()
+                await _send_json(send, encoded, _live_session_id(manager))
+                return
+            if method == "initialize":
+                _log_mcp("initialize")
+            elif method == "tools/call":
+                params = payload.get("params") if payload else None
+                name = params.get("name") if isinstance(params, dict) else ""
+                _log_mcp(f"tools/call {name}")
+            header_version = _header(headers, b"mcp-protocol-version")
+            if (
+                payload
+                and not _modern_envelope(payload)
+                and header_version
+                and header_version not in _HANDSHAKE_VERSIONS
+            ):
+                route = requested if requested in _HANDSHAKE_VERSIONS else "2025-11-25"
+                headers = _set_header(headers, b"mcp-protocol-version", route.encode("ascii"))
             current = _header(headers, b"mcp-session-id")
             instances = manager._server_instances
             live = _live_session_id(manager)
@@ -566,14 +647,37 @@ def _keep_process_session(manager: Any, path: str) -> None:
                 headers = _drop_header(headers, b"mcp-session-id")
             scope = dict(scope)
             scope["headers"] = headers
+            echo = requested if requested and requested not in _HANDSHAKE_VERSIONS and method == "initialize" else None
+            echoed: dict[str, Any] = {"start": None, "chunks": []}
 
             async def send_session(message: dict[str, Any]) -> None:
+                if echo is None:
+                    if message.get("type") == "http.response.start":
+                        message = dict(message)
+                        message["headers"] = _expose_session_id(list(message.get("headers") or []))
+                    await send(message)
+                    return
                 if message.get("type") == "http.response.start":
-                    message = dict(message)
-                    message["headers"] = _expose_session_id(list(message.get("headers") or []))
-                await send(message)
+                    echoed["start"] = dict(message)
+                    return
+                if message.get("type") != "http.response.body":
+                    await send(message)
+                    return
+                chunk = message.get("body") or b""
+                echoed["chunks"].append(chunk if isinstance(chunk, bytes) else bytes(chunk))
+                if message.get("more_body", False):
+                    return
+                start = echoed["start"] or {"type": "http.response.start", "status": 200, "headers": []}
+                restored = _echo_client_protocol(b"".join(echoed["chunks"]), echo)
+                response_headers = _expose_session_id(list(start.get("headers") or []))
+                response_headers = _set_header(response_headers, b"content-length", str(len(restored)).encode("ascii"))
+                response_headers = _set_header(response_headers, b"content-type", b"application/json")
+                start = dict(start)
+                start["headers"] = response_headers
+                await send(start)
+                await send({"type": "http.response.body", "body": restored})
 
-            await original(scope, receive, send_session)
+            await original(scope, replay, send_session)
             return
         await original(scope, receive, send)
 
@@ -653,10 +757,8 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
             allowed_origins=sorted(accepted_browser_origins()),
         ),
     )
-    app.add_middleware(_AdvertiseToolScopes)
     app.add_middleware(_PassthroughAcceptedOrigin)
     _install_confirm_authorize(app, server.pc_oauth)
-    _install_tool_scope_metadata(app)
     manager = server.session_manager
     if manager.stateless or not manager.json_response or manager.session_idle_timeout is not None:
         raise RuntimeError("PC control listener must keep one JSON session for the process")
@@ -677,11 +779,13 @@ def serve(host: str = HOST, port: int | None = None, path: str = HTTP_PATH) -> N
         )
     app = build_http_app(host=host, path=path)
     message = f"PC control MCP listening at http://{host}:{chosen}{path}"
+    tools = "PC control tools: " + ", ".join(listed_names())
     config = uvicorn.Config(app, host=host, port=chosen, log_level="info", lifespan="on")
 
     class _Server(uvicorn.Server):
         async def startup(self, sockets=None):  # type: ignore[no-untyped-def]
             await super().startup(sockets=sockets)
-            print(message, flush=True)
+            _log_mcp(message)
+            _log_mcp(tools)
 
     _Server(config).run()

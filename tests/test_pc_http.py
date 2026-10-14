@@ -156,16 +156,15 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
             assert name in pinggy["tools"]
             fields = pinggy["tool_fields"][name]
             assert fields["title"] and fields["description"] and fields["inputSchema"]
-        for scopes in (
-            pinggy["token_scopes"],
-            pinggy["sesame_scopes"],
-            pinggy["protected_scopes"],
-            pinggy["authorization_scopes"],
-        ):
-            assert list(scopes[:4]) == list(visible)
-            for name in visible:
-                assert name in scopes
-        assert 'scope="windows look click type' in pinggy["www_authenticate"]
+        assert pinggy["tools"] == list(EXPECTED)
+        assert pinggy["token_scopes"] == []
+        assert pinggy["sesame_scopes"] == []
+        for name in visible:
+            assert name not in pinggy["protected_scopes"]
+            assert name not in pinggy["authorization_scopes"]
+        assert "scope=" not in pinggy["www_authenticate"]
+        assert pinggy["stored_tools"] == list(EXPECTED)
+        assert pinggy["negotiated_protocol"] == "2026-07-28"
         names, click, refused = asyncio.run(_listed_and_called(port, pinggy["access_token"]))
         assert names == list(EXPECTED)
         assert click["ok"] is True
@@ -505,6 +504,23 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     )
     if modern_status != 200 or not modern_headers.get("mcp-session-id"):
         raise AssertionError(f"2026 initialize {modern_status} {modern_headers!r}: {modern_body!r}")
+    negotiated_protocol = json.loads(modern_body.decode())["result"]["protocolVersion"]
+    if negotiated_protocol != "2026-07-28":
+        raise AssertionError(f"initialize forced protocol {negotiated_protocol}")
+    stored_status, _stored_headers, stored_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": "Bearer sesame-stored-empty-scope",
+            "mcp-protocol-version": "2025-11-25",
+        },
+    )
+    if stored_status != 200:
+        raise AssertionError(f"stored empty-scope tools/list {stored_status}: {stored_body!r}")
+    stored_tools = [tool["name"] for tool in json.loads(stored_body.decode())["result"]["tools"]]
     sesame = _sesame_unknown_client(request)
     www = unauthenticated_headers.get("www-authenticate", "")
     return {
@@ -531,6 +547,8 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         "sesame_access_token": sesame["access_token"],
         "sesame_scopes": sesame["scopes"],
         "www_authenticate": www,
+        "stored_tools": stored_tools,
+        "negotiated_protocol": negotiated_protocol,
     }
 
 

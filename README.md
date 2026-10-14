@@ -118,9 +118,16 @@ Mutating ones honor `dry_run` and `VISION_ALLOW_SCREEN_CONTROL`. A protected
 window returns `needs_permission` and does not run; there is no confirm flag
 for the model. On Windows, `pip install -e ".[pc]"`.
 
-Miles sees those tools over streamable HTTP. From `desktop_agent\control`:
+Miles sees those tools over streamable HTTP. The implementation is
+`desktop_agent\control\pc_control\server.py`. Either directory works:
 
 ```powershell
+cd desktop_agent
+python -m pc_control.server
+```
+
+```powershell
+cd desktop_agent\control
 python -m pc_control.server
 ```
 
@@ -139,7 +146,7 @@ Miles Memory and this agent are not one server.
 
 | | Vision agent | Miles Memory |
 | --- | --- | --- |
-| Process | `python -m pc_control.server` from `desktop_agent\control` | `python -m memory_kb` |
+| Process | `python -m pc_control.server` from `desktop_agent` or `desktop_agent\control` | `python -m memory_kb` |
 | Port | `127.0.0.1:8770` | `127.0.0.1:8765` (unchanged) |
 | Surface | `http://127.0.0.1:8770/mcp` | `http://127.0.0.1:8765/mcp` or stdio |
 | Tools | the ten `pc_*` tools | `memory_recall`, `search_memories`, and the other `memory_kb` tools |

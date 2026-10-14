@@ -589,3 +589,113 @@ def test_default_port_is_not_memory() -> None:
     assert PORT == 8770
     assert PORT != 8765
     assert HTTP_PATH == "/mcp"
+
+
+def test_server_module_starts_from_control_and_desktop_agent(tmp_path: Path) -> None:
+    """Both directories resolve ``python -m pc_control.server`` to the real listener."""
+    real = CONTROL / "pc_control" / "server.py"
+    shim = CONTROL.parent / "pc_control" / "server.py"
+    assert real.is_file()
+    assert shim.is_file()
+    assert "desktop_agent.control.pc_control.server" in shim.read_text(encoding="utf-8")
+    for cwd, port in ((CONTROL, 18781), (CONTROL.parent, 18782)):
+        proc, output = _boot_listener(tmp_path / f"site-{port}", cwd, port)
+        try:
+            assert f"http://{HOST}:{port}{HTTP_PATH}" in output
+            assert "ModuleNotFoundError" not in output
+            assert proc.poll() is None
+            status = _mcp_status(port)
+            assert status == 401
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def _boot_listener(site: Path, cwd: Path, port: int) -> tuple[subprocess.Popen[str], str]:
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        textwrap.dedent(
+            """
+            import ctypes, sys, types
+
+            class _Win:
+                def __getattr__(self, name):
+                    return self
+                def __call__(self, *args, **kwargs):
+                    return self
+
+            ctypes.windll = _Win()
+            ctypes.WinDLL = lambda *args, **kwargs: _Win()
+
+            def _mod(name):
+                module = types.ModuleType(name)
+                sys.modules[name] = module
+                return module
+
+            auto = _mod("uiautomation")
+            auto.UIAutomationInitializerInThread = lambda *args, **kwargs: _Win()
+            for missing in ("win32gui", "win32process", "win32api", "win32con", "cv2", "numpy"):
+                _mod(missing)
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(site) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PC_CONTROL_HTTP_PORT"] = str(port)
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pc_control.server"],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output = ""
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            output += proc.stdout.read() if proc.stdout else ""
+            raise AssertionError(f"{cwd} exited {proc.returncode}: {output}")
+        line = proc.stdout.readline() if proc.stdout else ""
+        output += line
+        if f"http://{HOST}:{port}{HTTP_PATH}" in output:
+            return proc, output
+    raise AssertionError(f"{cwd} did not stay up: {output}")
+
+
+def _mcp_status(port: int) -> int:
+    import http.client
+    import json
+
+    posted = http.client.HTTPConnection(HOST, port, timeout=5)
+    posted.request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "miles", "version": "0"},
+                },
+            }
+        ).encode(),
+        headers={
+            "Host": "aetherbridge.a.pinggy.link",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    response = posted.getresponse()
+    status = response.status
+    response.read()
+    posted.close()
+    return status

@@ -1,6 +1,8 @@
 """Streamable HTTP MCP listener for the registered ``pc_*`` bridge tools.
 
-Run from ``desktop_agent/control`` with ``python -m pc_control.server``.
+Run ``python -m pc_control.server`` from ``desktop_agent/control`` or from
+``desktop_agent``. Both load this package. The second directory uses the shim
+at ``desktop_agent/pc_control``.
 The process listens on ``127.0.0.1:8770`` at ``/mcp``. Miles Memory keeps
 ``127.0.0.1:8765`` and its own ``/mcp``. This module does not import
 ``memory_kb``.

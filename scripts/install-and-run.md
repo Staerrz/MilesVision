@@ -63,7 +63,14 @@ Miles Memory stays a second process. Start it the way that repo documents
 this package.
 
 The PC control listener is a third process, not a route on Miles Memory.
-From `desktop_agent\control`:
+The module that serves it is `desktop_agent\control\pc_control\server.py`.
+From `desktop_agent`:
+
+```powershell
+python -m pc_control.server
+```
+
+From `desktop_agent\control` the same command loads that file directly:
 
 ```powershell
 python -m pc_control.server

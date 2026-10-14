@@ -330,17 +330,21 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     capabilities = json.loads(init_body.decode())["result"]["capabilities"]
     if not isinstance(capabilities.get("tools"), dict):
         raise AssertionError(f"initialize capabilities {capabilities!r}")
+    session_id = init_headers.get("mcp-session-id")
+    if not session_id:
+        raise AssertionError(f"initialize did not set mcp-session-id: {init_headers!r}")
+    with_session = {**bearer, "mcp-session-id": session_id}
     request(
         "POST",
         HTTP_PATH,
         body=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode(),
-        headers=bearer,
+        headers=with_session,
     )
     listed_status, _listed_headers, listed_body = request(
         "POST",
         HTTP_PATH,
         body=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode(),
-        headers=bearer,
+        headers=with_session,
     )
     if listed_status != 200:
         raise AssertionError(f"tools/list {listed_status}: {listed_body!r}")
@@ -350,17 +354,28 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         raise AssertionError(f"tools/list was SSE: {listed_body[:200]!r}")
     listed = json.loads(listed_body.decode())
     from desktop_agent.bridge import api as bridge_api
-    from desktop_agent.control.pc_control.http_server import argument_schema
+    from desktop_agent.control.pc_control.http_server import argument_schema, tool_description
 
     by_name = {tool["name"]: tool for tool in listed["result"]["tools"]}
     for name in EXPECTED:
         tool = by_name[name]
         schema = tool.get("inputSchema")
-        expected = argument_schema(getattr(bridge_api, name))
+        fn = getattr(bridge_api, name)
+        expected = argument_schema(fn)
         if schema != expected:
             raise AssertionError(f"{name} inputSchema {schema!r} != {expected!r}")
         if not schema.get("properties"):
             raise AssertionError(f"{name} inputSchema has no arguments")
+        if "confirm" in schema["properties"]:
+            raise AssertionError(f"{name} invented confirm")
+        if "additionalProperties" in schema:
+            raise AssertionError(f"{name} inputSchema is closed: {schema!r}")
+        description = tool.get("description") or ""
+        if description != tool_description(fn):
+            raise AssertionError(f"{name} description {description!r}")
+        for arg in schema["properties"]:
+            if arg not in description:
+                raise AssertionError(f"{name} description omits {arg}: {description!r}")
     called_status, called_headers, called_body = request(
         "POST",
         HTTP_PATH,
@@ -369,17 +384,43 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "pc_click", "arguments": {"window": "Notepad", "target": "12", "dry_run": True}},
+                "params": {
+                    "name": "pc_click",
+                    "arguments": {"window": "Notepad", "target": "12", "dry_run": True, "confirm": False},
+                },
             }
         ).encode(),
-        headers=bearer,
+        headers=with_session,
     )
+    if called_status == 404:
+        raise AssertionError(f"tools/call 404 for session {session_id}: {called_body!r}")
     if called_status != 200 or "application/json" not in called_headers.get("content-type", ""):
         raise AssertionError(f"tools/call {called_status}: {called_body!r}")
+    if called_headers.get("mcp-session-id") != session_id:
+        raise AssertionError(f"tools/call session {called_headers.get('mcp-session-id')!r} != {session_id}")
     called = json.loads(called_body.decode())
     called_text = json.dumps(called)
     if "dry_run" not in called_text or called.get("error"):
         raise AssertionError(f"tools/call did not reach the bridge: {called!r}")
+    modern_status, modern_headers, modern_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                    "clientInfo": {"name": "miles", "version": "0"},
+                },
+            }
+        ).encode(),
+        headers={**bearer, "mcp-protocol-version": "2026-07-28"},
+    )
+    if modern_status != 200 or not modern_headers.get("mcp-session-id"):
+        raise AssertionError(f"2026 initialize {modern_status} {modern_headers!r}: {modern_body!r}")
     sesame = _sesame_unknown_client(request)
     www = unauthenticated_headers.get("www-authenticate", "")
     return {

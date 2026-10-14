@@ -65,6 +65,22 @@ def registered_tools() -> tuple[Callable[..., Any], ...]:
     return tuple(tools)
 
 
+# What the model reads. The first sentence is the exact argument names.
+# ``confirm`` is a PC-Control parameter this bridge does not accept, so it is
+# not listed and not added to the schema.
+_TOOL_TEXT: dict[str, str] = {
+    "pc_windows": "List open windows as hwnd, process, and title, most recent first. filter matches the title or process. Empty lists every window.",
+    "pc_look": "See a window without focusing it. window is a title substring or hwnd. mode defaults to auto. find limits the elements, including those out of view. wait is seconds to poll.",
+    "pc_click": "Click an element id from pc_look, its exact name, or x,y pixels of the last image. right and double default to false. dry_run true returns the plan and does not change the screen.",
+    "pc_type": "Type into an element id from pc_look, or its name. replace true replaces the current text. dry_run true returns the plan and does not change the screen.",
+    "pc_drag": "Drag through image points. shape defaults to path. right defaults to false. dry_run true returns the plan and does not change the screen.",
+    "pc_key": "Send a key or the app's own shortcut. name is enter, tab, esc, arrows, or a shortcut such as ctrl+s. dry_run true returns the plan and does not change the screen.",
+    "pc_scroll": "Scroll the window or an element id. direction defaults to down. amount defaults to 1. dry_run true returns the plan and does not change the screen.",
+    "pc_read": "Read the window's document, page, or editor, or one element. target empty reads the window. start defaults to 0. length defaults to 6000. find limits the lines.",
+    "pc_show": "Mark an element id so the user can see it. Nothing is clicked. label and seconds default to empty and 10. dry_run true returns the plan and does not change the screen.",
+    "pc_open_app": "Launch an app minimized and unfocused. command is the program and its arguments. hidden defaults to false. dry_run true returns the plan and does not start the app.",
+}
+
 # Descriptions for parameters the registered functions actually take.
 # ``confirm`` is not one of them.
 _ARGUMENT_TEXT: dict[str, dict[str, str]] = {
@@ -133,7 +149,12 @@ _ARGUMENT_TEXT: dict[str, dict[str, str]] = {
 
 
 def argument_schema(fn: Callable[..., Any]) -> dict[str, Any]:
-    """JSON Schema for ``fn``'s real parameters. No extra names are added."""
+    """JSON Schema for ``fn``'s real parameters. No extra names are added.
+
+    ``additionalProperties`` is left unset. A closed schema rejects a normal
+    agent call before it is posted when the model also sends a name this
+    function does not take, such as PC-Control's ``confirm``.
+    """
     from typing import get_type_hints
 
     signature = inspect.signature(fn)
@@ -150,17 +171,23 @@ def argument_schema(fn: Callable[..., Any]) -> dict[str, Any]:
         }
         if param.default is inspect.Parameter.empty:
             required.append(name)
-    published: dict[str, Any] = {
-        "type": "object",
-        "properties": properties,
-        "additionalProperties": False,
-    }
+    published: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         published["required"] = required
     unknown = set(help_for) - set(properties)
     if unknown:
         raise RuntimeError(f"{fn.__name__} describes unknown parameters: {sorted(unknown)}")
+    missing = set(properties) - set(help_for)
+    if fn.__name__ in _ARGUMENT_TEXT and missing:
+        raise RuntimeError(f"{fn.__name__} is missing argument text: {sorted(missing)}")
     return published
+
+
+def tool_description(fn: Callable[..., Any]) -> str:
+    """The description the model sees, leading with the exact argument names."""
+    names = ", ".join(argument_schema(fn)["properties"])
+    behavior = _TOOL_TEXT.get(fn.__name__, (fn.__doc__ or fn.__name__).strip())
+    return f"Argument names: {names}. {behavior}"
 
 
 def _json_type_name(annotation: Any) -> str:
@@ -260,8 +287,7 @@ def build_server() -> Any:
         if tool is None:
             raise RuntimeError(f"{fn.__name__} was not registered")
         tool.parameters = argument_schema(fn)
-        if not (tool.description or "").strip():
-            tool.description = tool.name
+        tool.description = tool_description(fn)
     _advertise_tools_only(server)
     return server
 
@@ -315,32 +341,85 @@ def _live_session_id(manager: Any) -> str | None:
     return next(reversed(instances))
 
 
-def _keep_process_session(manager: Any, path: str) -> None:
-    """Do not end the session when initialize or tools/list finishes.
+# Handshake revisions return ``Mcp-Session-Id``. ``2026-07-28`` is a stateless
+# one-shot and does not, so a client that already listed tools never posts
+# ``tools/call``.
+_HANDSHAKE_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"})
 
-    A client that sees the session terminate keeps the tool list and never
-    opens tools/call. A later POST with no ``mcp-session-id`` is attached to
-    the session this process already initialized. A stale id from an earlier
-    process is dropped so it does not 404.
+
+def _keep_process_session(manager: Any, path: str) -> None:
+    """Keep the session initialize created, and return its id.
+
+    ``initialize`` answers with ``Mcp-Session-Id``. That id stays valid after
+    ``tools/list``. A later ``tools/call`` that sends it is handled. A POST
+    with no session id is attached to the same session. A protocol version
+    that would take the stateless path is served on the handshake path so the
+    response still carries the id. A stale id from an earlier process is
+    dropped only when this process has no session yet, so initialize can open
+    one instead of answering 404.
     """
     original = manager.asgi_app
 
     async def asgi_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") == "http" and scope.get("path", "").rstrip("/") == path.rstrip("/"):
+            if scope.get("method") == "OPTIONS":
+                await _send_cors(send, 204)
+                return
             headers = list(scope.get("headers") or [])
+            version = _header(headers, b"mcp-protocol-version")
+            if version is not None and version not in _HANDSHAKE_VERSIONS:
+                headers = _set_header(headers, b"mcp-protocol-version", b"2025-11-25")
             current = _header(headers, b"mcp-session-id")
             instances = manager._server_instances
             live = _live_session_id(manager)
             if live is not None and (current is None or current not in instances):
                 headers = _set_header(headers, b"mcp-session-id", live.encode("ascii"))
-                scope = dict(scope)
-                scope["headers"] = headers
             elif live is None and current is not None:
-                scope = dict(scope)
-                scope["headers"] = _drop_header(headers, b"mcp-session-id")
+                headers = _drop_header(headers, b"mcp-session-id")
+            scope = dict(scope)
+            scope["headers"] = headers
+
+            async def send_session(message: dict[str, Any]) -> None:
+                if message.get("type") == "http.response.start":
+                    message = dict(message)
+                    message["headers"] = _expose_session_id(list(message.get("headers") or []))
+                await send(message)
+
+            await original(scope, receive, send_session)
+            return
         await original(scope, receive, send)
 
     manager.asgi_app = asgi_app
+
+
+def _expose_session_id(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    """Publish the session id under the spec name and let a browser read it."""
+    session = _header(headers, b"mcp-session-id")
+    if session:
+        headers.append((b"Mcp-Session-Id", session.encode("ascii")))
+    if _header(headers, b"access-control-expose-headers") is None:
+        headers.append((b"Access-Control-Expose-Headers", b"Mcp-Session-Id"))
+    return headers
+
+
+async def _send_cors(send: Any, status: int) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"access-control-allow-origin", b"*"),
+                (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+                (
+                    b"access-control-allow-headers",
+                    b"Authorization, Content-Type, Accept, Mcp-Session-Id, mcp-protocol-version",
+                ),
+                (b"access-control-expose-headers", b"Mcp-Session-Id"),
+                (b"content-length", b"0"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": b""})
 
 
 def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
@@ -350,9 +429,10 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
     manager's ``run()``, entered when uvicorn starts and left when it stops.
     Requests do not build another manager.
 
-    JSON responses stay on. The session is not stateless: it is not terminated
-    after initialize or tools/list, so a later tools/call is still served.
-    Requests omit ``mcp-session-id`` and still reach that session.
+    JSON responses stay on. ``initialize`` sets ``Mcp-Session-Id`` and that
+    session is not terminated after initialize or tools/list. A later
+    tools/call that sends the id is served. A request that omits the id still
+    reaches the same session.
     DNS-rebinding protection is off, the same way a tunneled host such as
     ``aetherbridge.a.pinggy.link`` is allowed through to Miles Memory.
     """

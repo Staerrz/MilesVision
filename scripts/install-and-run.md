@@ -77,7 +77,8 @@ aetherbridge.a.pinggy.link` is accepted. An unauthenticated `POST /mcp` is
 200, the confirm page, even when that `client_id` was not registered with
 this process. Approve the page, then exchange the code at `/token`. Send
 `Authorization: Bearer` with `Content-Type: application/json` and `Accept:
-application/json`. `initialize` includes `capabilities.tools`. `tools/list`
+application/json`. `initialize` includes `capabilities.tools` and sets
+`mcp-session-id`. Send that id on `tools/call`. `tools/list`
 is JSON, not an empty SSE stream, and returns `pc_windows`, `pc_look`, `pc_click`,
 `pc_type`, `pc_drag`, `pc_key`, `pc_scroll`, `pc_read`, `pc_show`, and
 `pc_open_app`.

@@ -2,9 +2,9 @@
 
 The implementations are ``desktop_agent.control.pc_control.server.TOOLS``:
 ``windows``, ``look``, ``click``, ``type``, ``drag``, ``key``, ``scroll``,
-``read``, ``show``, ``open_app``. Names on the bridge are prefixed ``pc_`` so
-they do not replace ``mouse_click``, ``keyboard_type``, ``mouse_drag``, or
-``keyboard_hotkey``.
+``read``, ``show``, ``open_app``. Those names are on the bridge. ``pc_*``
+aliases call the same tools. Neither set replaces ``mouse_click``,
+``keyboard_type``, ``mouse_drag``, or ``keyboard_hotkey``.
 
 Miles Memory is not imported. The HTTP listener is ``pc_control.server``.
 """

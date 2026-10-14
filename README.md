@@ -138,7 +138,7 @@ page, including a client id that was registered on another process.
 `redirect_uri` `https://sesameai.app/api/oauth/external-mcp/callback` and a
 long `state` are accepted. Approving that page, then `POST /token` with the
 matching PKCE verifier, returns an access token. `POST /token` before a code
-stays 401. With the bearer token, `initialize` returns `capabilities.tools` as `{}`. `tools/list` is JSON. Each tool has `name`, `title`, `description`, and `inputSchema`. The names are `windows`, `look`, `click`, `type`, `drag`, `key`, `scroll`, `read`, `show`, and `open_app`, plus the `pc_*` aliases of those same functions. A trigger for `click` or `type` resolves to the PC-Control implementation. Calls still go through `desktop_agent.bridge`.
+stays 401. With the bearer token, `initialize` returns `capabilities.tools` as `{}`. `tools/list` is JSON. Each tool has `name`, `title`, `description`, and `inputSchema`. The names are `windows`, `look`, `click`, `type`, `drag`, `key`, `scroll`, `read`, `show`, and `open_app`. Each object has its own title, so a kit keyed by title keeps `click`. `pc_*` is still accepted on `tools/call` and is not copied into that list. `mouse_click` and `keyboard_type` stay on the bridge and are not these tools. Calls still go through `desktop_agent.bridge`.
 
 ## Two processes, two bridges
 
@@ -149,7 +149,7 @@ Miles Memory and this agent are not one server.
 | Process | `python -m pc_control.server` from `desktop_agent` or `desktop_agent\control` | `python -m memory_kb` |
 | Port | `127.0.0.1:8770` | `127.0.0.1:8765` (unchanged) |
 | Surface | `http://127.0.0.1:8770/mcp` | `http://127.0.0.1:8765/mcp` or stdio |
-| Tools | the ten `pc_*` tools | `memory_recall`, `search_memories`, and the other `memory_kb` tools |
+| Tools | `windows`, `look`, `click`, `type`, and the other short PC-Control names | `memory_recall`, `search_memories`, and the other `memory_kb` tools |
 | Registry | this process only | the memory process only |
 
 Nothing here vendors `memory_kb`, binds port 8765, or registers memory tools

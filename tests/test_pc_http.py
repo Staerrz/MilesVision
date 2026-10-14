@@ -40,13 +40,25 @@ def test_one_session_manager_for_the_process_lifespan() -> None:
 def test_registered_names_match_the_bridge() -> None:
     names = tuple(fn.__name__ for fn in registered_tools())
     assert names == tuple(f"pc_{name}" for name in SOURCE_NAMES)
-    assert listed_names()[: len(SOURCE_NAMES)] == tuple(SOURCE_NAMES)
+    assert listed_names() == tuple(SOURCE_NAMES)
     assert "click" in listed_names()
     assert "type" in listed_names()
-    assert "pc_click" in listed_names()
+    assert "windows" in listed_names()
+    assert "look" in listed_names()
+    assert "pc_click" not in listed_names()
     assert "mouse_click" not in listed_names()
     assert "keyboard_type" not in listed_names()
     assert "memory_recall" not in names
+    from desktop_agent.bridge.api import Bridge
+    import desktop_agent.bridge as bridge_mod
+
+    for name in ("windows", "look", "click", "type"):
+        assert callable(getattr(Bridge, name))
+        assert callable(getattr(bridge_mod, name))
+    assert callable(getattr(Bridge, "mouse_click"))
+    assert callable(getattr(Bridge, "keyboard_type"))
+    assert callable(getattr(bridge_mod, "mouse_click"))
+    assert callable(getattr(bridge_mod, "keyboard_type"))
 
 
 def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
@@ -420,6 +432,18 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     from desktop_agent.control.pc_control.http_server import argument_schema, bridge_callable, tool_description
 
     by_name = {tool["name"]: tool for tool in listed["result"]["tools"]}
+    titles = [tool.get("title") for tool in listed["result"]["tools"]]
+    if len(titles) != len(set(titles)):
+        raise AssertionError(f"duplicate titles {titles}")
+    if any(str(name).startswith("pc_") for name in by_name):
+        raise AssertionError(f"alias pair collapsed the kit: {sorted(by_name)}")
+    click_tool = by_name["click"]
+    if list(click_tool) != ["name", "title", "description", "inputSchema"]:
+        raise AssertionError(f"click keys {list(click_tool)}")
+    if "input_schema" in click_tool:
+        raise AssertionError(f"click uses input_schema: {click_tool!r}")
+    if click_tool["inputSchema"].get("type") != "object":
+        raise AssertionError(f"click inputSchema {click_tool['inputSchema']!r}")
     for name in EXPECTED:
         tool = by_name[name]
         if not tool.get("title") or not tool.get("description") or not tool.get("inputSchema"):

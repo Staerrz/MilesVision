@@ -51,8 +51,9 @@ def registered_tools() -> tuple[Callable[..., Any], ...]:
     """The bridge callables whose names are ``pc_`` plus each ``SOURCE_NAMES`` entry.
 
     Nothing else is registered. Screen, mouse, keyboard, and Miles Memory tools
-    stay off this listener. MCP ``tools/list`` publishes these under the
-    original short names (``click``, ``type``, ...) and keeps ``pc_*`` as aliases.
+    stay off this listener. MCP ``tools/list`` publishes the original short
+    names (``windows``, ``look``, ``click``, ``type``, ...). ``pc_*`` is
+    registered for ``tools/call`` and is not copied into the kit.
     """
     ensure_repo_on_path()
     from desktop_agent.bridge import api as bridge_api
@@ -69,17 +70,16 @@ def registered_tools() -> tuple[Callable[..., Any], ...]:
 
 
 def listed_names() -> tuple[str, ...]:
-    """Names ``tools/list`` returns.
+    """Names ``tools/list`` copies into the agent kit.
 
-    The original PC-Control names come first, so a toolkit trigger for
-    ``click`` or ``type`` matches. ``pc_*`` follows as an alias of the same
-    function, so a client that still looks up ``pc_click`` does not miss it.
-    ``mouse_click`` and ``keyboard_type`` are not in this list.
+    Only the original PC-Control names. Each object has its own title.
+    ``pc_*`` stays registered for ``tools/call`` and is not in this list: a
+    second object with the same title replaces ``click`` in a kit keyed by
+    title. ``mouse_click`` and ``keyboard_type`` are not in this list.
     """
     from desktop_agent.bridge.pc import SOURCE_NAMES
 
-    short = tuple(SOURCE_NAMES)
-    return short + tuple(f"pc_{name}" for name in short)
+    return tuple(SOURCE_NAMES)
 
 
 def bridge_callable(listed_name: str) -> Callable[..., Any]:
@@ -317,7 +317,8 @@ def build_server() -> Any:
         auth_server_provider=provider,
     )
     server.pc_oauth = provider
-    for listed_name in listed_names():
+
+    def register(listed_name: str) -> None:
         fn = bridge_callable(listed_name)
         source = listed_name[3:] if listed_name.startswith("pc_") else listed_name
         title = _TITLES[source]
@@ -337,6 +338,12 @@ def build_server() -> Any:
         tool.title = title
         if not tool.name or not tool.title or not tool.description or not tool.parameters.get("properties"):
             raise RuntimeError(f"{listed_name} is missing name, title, description, or inputSchema")
+
+    for listed_name in listed_names():
+        register(listed_name)
+    # Callable aliases. Omitted from the catalog so they cannot collapse the kit.
+    for listed_name in listed_names():
+        register(f"pc_{listed_name}")
     _advertise_tools_only(server)
     return server
 
@@ -499,19 +506,33 @@ def _requested_protocol(headers: list[tuple[bytes, bytes]], payload: dict[str, A
 
 
 def _tool_catalog() -> list[dict[str, Any]]:
-    """Every registered tool. Scope is not consulted."""
+    """The kit a client copies from tools/list. Scope is not consulted.
+
+    One object per short name. The keys are ``name``, ``title``,
+    ``description``, and ``inputSchema``. Titles are unique. ``pc_*`` aliases
+    are not copied.
+    """
     catalog: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
     for name in listed_names():
         fn = bridge_callable(name)
-        source = name[3:] if name.startswith("pc_") else name
-        catalog.append(
-            {
-                "name": name,
-                "title": _TITLES[source],
-                "description": tool_description(fn),
-                "inputSchema": argument_schema(fn),
-            }
-        )
+        schema = argument_schema(fn)
+        if schema.get("type") != "object":
+            raise RuntimeError(f"{name} inputSchema type is not object")
+        entry = {
+            "name": name,
+            "title": _TITLES[name],
+            "description": tool_description(fn),
+            "inputSchema": schema,
+        }
+        if tuple(entry) != ("name", "title", "description", "inputSchema"):
+            raise RuntimeError(f"{name} tool keys {tuple(entry)}")
+        if "input_schema" in entry or not entry["description"]:
+            raise RuntimeError(f"{name} is not a kit tool")
+        if entry["title"] in seen_titles:
+            raise RuntimeError(f"{name} repeats title {entry['title']}")
+        seen_titles.add(entry["title"])
+        catalog.append(entry)
     return catalog
 
 

@@ -54,6 +54,20 @@ def test_dry_run_click_does_not_need_windows(tmp_path: Path) -> None:
     assert any(event["name"] == "pc_click" for event in recent["outcome"]["events"])
 
 
+def test_short_names_log_themselves_and_leave_win32_tools(tmp_path: Path) -> None:
+    bridge = _bridge(tmp_path)
+    result = bridge.click("Notepad", "12", dry_run=True)
+    assert result["tool"] == "click"
+    typed = bridge.type("Notepad", "12", "hi", dry_run=True)
+    assert typed["tool"] == "type"
+    assert callable(bridge.mouse_click)
+    assert callable(bridge.keyboard_type)
+    recent = bridge.memory_get_recent(limit=5)
+    names = [event["name"] for event in recent["outcome"]["events"]]
+    assert "click" in names
+    assert "pc_click" not in names
+
+
 def test_screen_control_off_refuses_open(tmp_path: Path) -> None:
     bridge = _bridge(tmp_path)
     result = bridge.pc_open_app("notepad.exe", dry_run=False)

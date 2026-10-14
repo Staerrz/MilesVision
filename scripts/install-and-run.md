@@ -87,10 +87,10 @@ this process. Approve the page, then exchange the code at `/token`. Send
 application/json`. `initialize` includes `capabilities.tools` and sets
 `mcp-session-id`. Send that id on `tools/call`. `tools/list`
 is JSON, not an empty SSE stream. Each tool has `name`, `title`, `description`,
-and `inputSchema`. The names are `windows`, `look`, `click`, `type`, `drag`,
-`key`, `scroll`, `read`, `show`, and `open_app`, and the same tools again as
-`pc_windows`, `pc_look`, `pc_click`, `pc_type`, `pc_drag`, `pc_key`,
-`pc_scroll`, `pc_read`, `pc_show`, and `pc_open_app`.
+and `inputSchema` (`inputSchema.type` is `object`). The names copied into the
+agent kit are `windows`, `look`, `click`, `type`, `drag`, `key`, `scroll`,
+`read`, `show`, and `open_app`, each with its own title. `pc_*` is callable
+and is not in that list.
 
 ## Run the example
 

@@ -16,7 +16,7 @@ from typing import Any
 
 from desktop_agent.control.backend import InputBackend
 from desktop_agent.control.keyboard import press, type_text
-from desktop_agent.control.mouse import click, drag, move_mouse
+from desktop_agent.control.mouse import click as _win32_click, drag as _win32_drag, move_mouse
 from desktop_agent.control.window import focus_window
 from desktop_agent.core.logging import configure_logging, get_logger
 from desktop_agent.core.settings import Settings
@@ -279,7 +279,7 @@ class Bridge:
         return self._call(
             "mouse_click",
             params,
-            lambda: click(
+            lambda: _win32_click(
                 int(x),
                 int(y),
                 self.settings,
@@ -323,7 +323,7 @@ class Bridge:
         return self._call(
             "mouse_drag",
             params,
-            lambda: drag(
+            lambda: _win32_drag(
                 int(x1),
                 int(y1),
                 int(x2),
@@ -422,6 +422,121 @@ class Bridge:
                 approved=approved,
             ),
         )
+
+    def windows(self, filter: str = "") -> dict[str, Any]:
+        """List windows. The name a client copies from tools/list. Not ``window_focus``."""
+        params = {"filter": filter}
+        return self._call("windows", params, lambda: _pc("windows", params, self.settings, None))
+
+    def look(
+        self,
+        window: str,
+        mode: str = "auto",
+        find: str = "",
+        wait: float = 0,
+    ) -> dict[str, Any]:
+        """See one window. The name a client copies from tools/list."""
+        params = {"window": window, "mode": mode, "find": find, "wait": wait}
+        return self._call("look", params, lambda: _pc("look", params, self.settings, None))
+
+    def click(
+        self,
+        window: str,
+        target: str,
+        right: bool = False,
+        double: bool = False,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Click an element id from look. ``mouse_click`` stays the Win32 cursor click."""
+        params = {"window": window, "target": target, "right": right, "double": double}
+        return self._call("click", params, lambda: _pc("click", params, self.settings, dry_run))
+
+    def type(
+        self,
+        window: str,
+        target: str,
+        text: str,
+        replace: bool = False,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Type into an element id from look. ``keyboard_type`` stays the Win32 keystrokes."""
+        params = {"window": window, "target": target, "text": text, "replace": replace}
+        return self._call("type", params, lambda: _pc("type", params, self.settings, dry_run))
+
+    def drag(
+        self,
+        window: str,
+        points: str,
+        shape: str = "path",
+        right: bool = False,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Drag through image points. ``mouse_drag`` stays the Win32 cursor drag."""
+        params = {"window": window, "points": points, "shape": shape, "right": right}
+        return self._call("drag", params, lambda: _pc("drag", params, self.settings, dry_run))
+
+    def key(
+        self,
+        window: str,
+        name: str,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """A key or the app's own shortcut. ``keyboard_hotkey`` stays the Win32 press."""
+        params = {"window": window, "name": name}
+        return self._call("key", params, lambda: _pc("key", params, self.settings, dry_run))
+
+    def scroll(
+        self,
+        window: str,
+        direction: str = "down",
+        target: str = "",
+        amount: int = 1,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Scroll a window or element."""
+        params = {"window": window, "direction": direction, "target": target, "amount": amount}
+        return self._call("scroll", params, lambda: _pc("scroll", params, self.settings, dry_run))
+
+    def read(
+        self,
+        window: str,
+        target: str = "",
+        start: int = 0,
+        length: int = 6000,
+        find: str = "",
+    ) -> dict[str, Any]:
+        """Read a document, page, or field, including text out of view."""
+        params = {"window": window, "target": target, "start": start, "length": length, "find": find}
+        return self._call("read", params, lambda: _pc("read", params, self.settings, None))
+
+    def show(
+        self,
+        window: str,
+        target: str,
+        label: str = "",
+        seconds: int = 10,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Draw an orange circle for the user. Nothing is clicked."""
+        params = {"window": window, "target": target, "label": label, "seconds": seconds}
+        return self._call("show", params, lambda: _pc("show", params, self.settings, dry_run))
+
+    def open_app(
+        self,
+        command: str,
+        hidden: bool = False,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Launch an app minimized, or on the hidden desktop."""
+        params = {"command": command, "hidden": hidden}
+        return self._call("open_app", params, lambda: _pc("open_app", params, self.settings, dry_run))
 
     def pc_windows(self, filter: str = "") -> dict[str, Any]:
         """List windows. PC-Control ``windows``. Does not start a second server."""
@@ -815,3 +930,94 @@ def pc_show(
 def pc_open_app(command: str, hidden: bool = False, *, dry_run: bool | None = None) -> dict[str, Any]:
     """PC-Control ``open_app`` on the process bridge."""
     return get_bridge().pc_open_app(command, hidden=hidden, dry_run=dry_run)
+
+
+def windows(filter: str = "") -> dict[str, Any]:
+    """PC-Control ``windows`` on the process bridge. The kit name."""
+    return get_bridge().windows(filter)
+
+
+def look(window: str, mode: str = "auto", find: str = "", wait: float = 0) -> dict[str, Any]:
+    """PC-Control ``look`` on the process bridge. The kit name."""
+    return get_bridge().look(window, mode=mode, find=find, wait=wait)
+
+
+def click(
+    window: str,
+    target: str,
+    right: bool = False,
+    double: bool = False,
+    *,
+    dry_run: bool | None = None,
+) -> dict[str, Any]:
+    """PC-Control ``click`` on the process bridge. Not ``mouse_click``."""
+    return get_bridge().click(window, target, right=right, double=double, dry_run=dry_run)
+
+
+def type(
+    window: str,
+    target: str,
+    text: str,
+    replace: bool = False,
+    *,
+    dry_run: bool | None = None,
+) -> dict[str, Any]:
+    """PC-Control ``type`` on the process bridge. Not ``keyboard_type``."""
+    return get_bridge().type(window, target, text, replace=replace, dry_run=dry_run)
+
+
+def drag(
+    window: str,
+    points: str,
+    shape: str = "path",
+    right: bool = False,
+    *,
+    dry_run: bool | None = None,
+) -> dict[str, Any]:
+    """PC-Control ``drag`` on the process bridge. Not ``mouse_drag``."""
+    return get_bridge().drag(window, points, shape=shape, right=right, dry_run=dry_run)
+
+
+def key(window: str, name: str, *, dry_run: bool | None = None) -> dict[str, Any]:
+    """PC-Control ``key`` on the process bridge."""
+    return get_bridge().key(window, name, dry_run=dry_run)
+
+
+def scroll(
+    window: str,
+    direction: str = "down",
+    target: str = "",
+    amount: int = 1,
+    *,
+    dry_run: bool | None = None,
+) -> dict[str, Any]:
+    """PC-Control ``scroll`` on the process bridge."""
+    return get_bridge().scroll(window, direction=direction, target=target, amount=amount, dry_run=dry_run)
+
+
+def read(
+    window: str,
+    target: str = "",
+    start: int = 0,
+    length: int = 6000,
+    find: str = "",
+) -> dict[str, Any]:
+    """PC-Control ``read`` on the process bridge."""
+    return get_bridge().read(window, target=target, start=start, length=length, find=find)
+
+
+def show(
+    window: str,
+    target: str,
+    label: str = "",
+    seconds: int = 10,
+    *,
+    dry_run: bool | None = None,
+) -> dict[str, Any]:
+    """PC-Control ``show`` on the process bridge."""
+    return get_bridge().show(window, target, label=label, seconds=seconds, dry_run=dry_run)
+
+
+def open_app(command: str, hidden: bool = False, *, dry_run: bool | None = None) -> dict[str, Any]:
+    """PC-Control ``open_app`` on the process bridge."""
+    return get_bridge().open_app(command, hidden=hidden, dry_run=dry_run)

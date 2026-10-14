@@ -24,8 +24,9 @@ def test_one_session_manager_for_the_process_lifespan() -> None:
 
     app = build_http_app()
     manager = app.state.pc_session_manager
-    assert manager.stateless is True
+    assert manager.stateless is False
     assert manager.json_response is True
+    assert manager.session_idle_timeout is None
     assert manager._task_group is None
 
     async def enter_once() -> None:
@@ -118,6 +119,13 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         assert click["outcome"]["executed"] is False
         assert refused["ok"] is False
         assert "VISION_ALLOW_SCREEN_CONTROL" in refused["outcome"]["reason"]
+        rest = _drain(proc)
+        log = output + rest
+        assert "tools/call pc_click" in rest
+        assert "Terminating session: None" not in log
+        ended = log.find("Terminating session:")
+        if ended != -1:
+            assert ended > log.find("tools/call pc_click")
         assert proc.poll() is None
     finally:
         proc.terminate()
@@ -294,24 +302,12 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     if issued_status != 200:
         raise AssertionError(f"token {issued_status}: {issued_body!r}")
     access_token = json.loads(issued_body.decode())["access_token"]
-    listed_status, _listed_headers, listed_body = request(
-        "POST",
-        HTTP_PATH,
-        body=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "mcp-protocol-version": "2025-11-25",
-        },
-    )
-    if listed_status != 200:
-        raise AssertionError(f"tools/list {listed_status}: {listed_body!r}")
-    if "application/json" not in _listed_headers.get("content-type", ""):
-        raise AssertionError(f"tools/list content-type {_listed_headers.get('content-type')!r}")
-    if listed_body.startswith(b"event:") or listed_body.startswith(b":"):
-        raise AssertionError(f"tools/list was SSE: {listed_body[:200]!r}")
-    listed = json.loads(listed_body.decode())
+    bearer = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "mcp-protocol-version": "2025-11-25",
+    }
     init_status, init_headers, init_body = request(
         "POST",
         HTTP_PATH,
@@ -327,23 +323,44 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
                 },
             }
         ).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}",
-        },
+        headers=bearer,
     )
     if init_status != 200 or "application/json" not in init_headers.get("content-type", ""):
         raise AssertionError(f"initialize {init_status} {init_headers.get('content-type')}: {init_body!r}")
     capabilities = json.loads(init_body.decode())["result"]["capabilities"]
     if not isinstance(capabilities.get("tools"), dict):
         raise AssertionError(f"initialize capabilities {capabilities!r}")
-    for tool in listed["result"]["tools"]:
+    request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode(),
+        headers=bearer,
+    )
+    listed_status, _listed_headers, listed_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode(),
+        headers=bearer,
+    )
+    if listed_status != 200:
+        raise AssertionError(f"tools/list {listed_status}: {listed_body!r}")
+    if "application/json" not in _listed_headers.get("content-type", ""):
+        raise AssertionError(f"tools/list content-type {_listed_headers.get('content-type')!r}")
+    if listed_body.startswith(b"event:") or listed_body.startswith(b":"):
+        raise AssertionError(f"tools/list was SSE: {listed_body[:200]!r}")
+    listed = json.loads(listed_body.decode())
+    from desktop_agent.bridge import api as bridge_api
+    from desktop_agent.control.pc_control.http_server import argument_schema
+
+    by_name = {tool["name"]: tool for tool in listed["result"]["tools"]}
+    for name in EXPECTED:
+        tool = by_name[name]
         schema = tool.get("inputSchema")
-        if not tool.get("name") or not tool.get("description") or not isinstance(schema, dict):
-            raise AssertionError(f"tool shape {tool!r}")
-        if schema.get("type") != "object" or "anyOf" in json.dumps(schema):
-            raise AssertionError(f"inputSchema {schema!r}")
+        expected = argument_schema(getattr(bridge_api, name))
+        if schema != expected:
+            raise AssertionError(f"{name} inputSchema {schema!r} != {expected!r}")
+        if not schema.get("properties"):
+            raise AssertionError(f"{name} inputSchema has no arguments")
     called_status, called_headers, called_body = request(
         "POST",
         HTTP_PATH,
@@ -355,12 +372,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
                 "params": {"name": "pc_click", "arguments": {"window": "Notepad", "target": "12", "dry_run": True}},
             }
         ).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "mcp-protocol-version": "2025-11-25",
-        },
+        headers=bearer,
     )
     if called_status != 200 or "application/json" not in called_headers.get("content-type", ""):
         raise AssertionError(f"tools/call {called_status}: {called_body!r}")
@@ -475,6 +487,37 @@ def _sesame_unknown_client(request) -> dict:
         "token_before_code": before_status,
         "access_token": json.loads(issued_body.decode())["access_token"],
     }
+
+
+def _drain(proc: subprocess.Popen[str]) -> str:
+    """Read the listener pipe, including bytes ``readline`` already buffered.
+
+    ``select`` on the text stream misses lines sitting in the ``BufferedReader``
+    after the first ``readline`` prefetched them. A non-blocking ``readline``
+    returns that buffer, then raises ``BlockingIOError`` when the pipe is empty.
+    """
+    import os
+
+    if proc.stdout is None:
+        return ""
+    os.set_blocking(proc.stdout.fileno(), False)
+    chunks: list[str] = []
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        try:
+            line = proc.stdout.readline()
+        except BlockingIOError:
+            if "tools/call pc_click" in "".join(chunks):
+                break
+            time.sleep(0.05)
+            continue
+        if line:
+            chunks.append(line)
+            continue
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    return "".join(chunks)
 
 
 def test_default_port_is_not_memory() -> None:

@@ -69,7 +69,7 @@ From `desktop_agent\control`:
 python -m pc_control.server
 ```
 
-It stays up at `http://127.0.0.1:8770/mcp` as stateless JSON. `Host:
+It stays up at `http://127.0.0.1:8770/mcp` and answers JSON. The session is not dropped after initialize. `Host:
 aetherbridge.a.pinggy.link` is accepted. An unauthenticated `POST /mcp` is
 401, and `POST /token` before a code is 401. `GET /authorize` with
 `response_type=code`, PKCE S256, and

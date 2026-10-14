@@ -124,7 +124,7 @@ Miles sees those tools over streamable HTTP. From `desktop_agent\control`:
 python -m pc_control.server
 ```
 
-That stays up at `http://127.0.0.1:8770/mcp` as stateless JSON. Pinggy's host
+That stays up at `http://127.0.0.1:8770/mcp` and answers JSON. The session stays up after initialize, so a later `tools/call` with no `mcp-session-id` still runs. Pinggy's host
 `aetherbridge.a.pinggy.link` is accepted. OAuth stays on: an unauthenticated
 `POST /mcp` is 401. `GET /authorize` for a public PKCE client is a 200 confirm
 page, including a client id that was registered on another process.

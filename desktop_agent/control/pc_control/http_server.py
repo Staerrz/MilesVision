@@ -386,6 +386,62 @@ def _drop_header(headers: list[tuple[bytes, bytes]], name: bytes) -> list[tuple[
     return [(key, item) for key, item in headers if key.lower() != name]
 
 
+# The SDK answers ``Invalid Origin header`` with HTTP 403. That check can still
+# run after Host DNS-rebinding protection is off. A missing Origin is allowed.
+# Sesame's browser sends ``Origin: https://sesameai.app`` to the public host.
+# There is no handshake secret to paste into Sesame.
+_SESAME_ORIGIN = "https://sesameai.app"
+
+
+def accepted_browser_origins() -> frozenset[str]:
+    """Origin values that must not be HTTP 403 on this listener."""
+    from .oauth import DEFAULT_PUBLIC_ORIGIN, public_origin
+
+    found = {
+        _SESAME_ORIGIN,
+        DEFAULT_PUBLIC_ORIGIN.rstrip("/"),
+        public_origin().rstrip("/"),
+    }
+    with_port: set[str] = set()
+    for origin in found:
+        with_port.add(origin)
+        host = origin.split("://", 1)[-1]
+        if ":" not in host:
+            with_port.add(f"{origin}:443")
+    return frozenset(with_port)
+
+
+def _drop_accepted_origin(scope: dict[str, Any]) -> dict[str, Any]:
+    """Remove an allowlisted Origin so the SDK cannot answer 403 for it."""
+    if scope.get("type") != "http":
+        return scope
+    headers = list(scope.get("headers") or [])
+    origin = _header(headers, b"origin")
+    if origin is None:
+        return scope
+    allowed = {item.lower() for item in accepted_browser_origins()}
+    if origin.rstrip("/").lower() not in allowed:
+        return scope
+    scope = dict(scope)
+    scope["headers"] = _drop_header(headers, b"origin")
+    return scope
+
+
+class _PassthroughAcceptedOrigin:
+    """Run before auth and the SDK transport.
+
+    Unauthenticated ``POST /mcp`` still reaches the bearer check and stays
+    401. ``Origin`` is already gone, so a later Origin check cannot turn that
+    request, or a bearer ``initialize``, into 403.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        await self.app(_drop_accepted_origin(scope), receive, send)
+
+
 def _live_session_id(manager: Any) -> str | None:
     instances = getattr(manager, "_server_instances", {})
     if not instances:
@@ -417,6 +473,7 @@ def _keep_process_session(manager: Any, path: str) -> None:
             if scope.get("method") == "OPTIONS":
                 await _send_cors(send, 204)
                 return
+            scope = _drop_accepted_origin(scope)
             headers = list(scope.get("headers") or [])
             version = _header(headers, b"mcp-protocol-version")
             if version is not None and version not in _HANDSHAKE_VERSIONS:
@@ -487,9 +544,23 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
     reaches the same session.
     DNS-rebinding protection is off, the same way a tunneled host such as
     ``aetherbridge.a.pinggy.link`` is allowed through to Miles Memory.
+    ``Origin`` is still allowlisted and removed for Sesame
+    (``https://sesameai.app``) and that public origin. The SDK's Origin check
+    is the HTTP 403, and it can run after the Host check is off. No handshake
+    secret is required.
     """
+    from urllib.parse import urlsplit
+
     from mcp.server.transport_security import TransportSecuritySettings
 
+    from .oauth import DEFAULT_PUBLIC_ORIGIN, public_origin
+
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    for origin in (DEFAULT_PUBLIC_ORIGIN, public_origin()):
+        hostname = urlsplit(origin).hostname
+        if hostname and hostname not in hosts:
+            hosts.append(hostname)
+            hosts.append(f"{hostname}:*")
     server = build_server()
     app = server.streamable_http_app(
         streamable_http_path=path,
@@ -497,8 +568,13 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
         stateless_http=False,
         session_idle_timeout=None,
         host=host,
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+            allowed_hosts=hosts,
+            allowed_origins=sorted(accepted_browser_origins()),
+        ),
     )
+    app.add_middleware(_PassthroughAcceptedOrigin)
     _install_confirm_authorize(app, server.pc_oauth)
     manager = server.session_manager
     if manager.stateless or not manager.json_response or manager.session_idle_timeout is not None:

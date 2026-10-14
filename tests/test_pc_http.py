@@ -76,6 +76,40 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
             auto.UIAutomationInitializerInThread = lambda *args, **kwargs: _Win()
             for missing in ("win32gui", "win32process", "win32api", "win32con", "cv2", "numpy"):
                 _mod(missing)
+
+            # The installed SDK skips Origin when DNS-rebinding protection is off.
+            # Sesame still gets HTTP 403 from that check on builds that keep
+            # running it. Force it here, with an empty Origin allowlist, so a
+            # request that still carries Origin: https://sesameai.app fails.
+            import mcp.server.transport_security as _ts
+
+            _validate = _ts.TransportSecurityMiddleware.validate_request
+
+            async def _origin_still_checked(self, request, is_post=False):
+                saved = (
+                    self.settings.enable_dns_rebinding_protection,
+                    list(self.settings.allowed_origins),
+                    list(self.settings.allowed_hosts),
+                )
+                self.settings.enable_dns_rebinding_protection = True
+                self.settings.allowed_origins = []
+                self.settings.allowed_hosts = [
+                    "127.0.0.1:*",
+                    "localhost:*",
+                    "[::1]:*",
+                    "aetherbridge.a.pinggy.link",
+                    "aetherbridge.a.pinggy.link:*",
+                ]
+                try:
+                    return await _validate(self, request, is_post=is_post)
+                finally:
+                    (
+                        self.settings.enable_dns_rebinding_protection,
+                        self.settings.allowed_origins,
+                        self.settings.allowed_hosts,
+                    ) = saved
+
+            _ts.TransportSecurityMiddleware.validate_request = _origin_still_checked
             """
         ),
         encoding="utf-8",
@@ -197,7 +231,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
         posted = http.client.HTTPConnection(HOST, port, timeout=5)
-        sent = {"Host": tunnel_host}
+        sent = {"Host": tunnel_host, "Origin": "https://sesameai.app"}
         if headers:
             sent.update(headers)
         posted.request(method, path, body=body, headers=sent)
@@ -225,6 +259,8 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         ).encode(),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
     )
+    if unauthenticated_status != 401 or b"Invalid Origin" in _raw:
+        raise AssertionError(f"unauthenticated POST /mcp {unauthenticated_status}: {_raw!r}")
     token_route_status, _token_headers, _token_raw = request(
         "POST",
         "/token",
@@ -330,6 +366,8 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         ).encode(),
         headers=bearer,
     )
+    if init_status == 403 or b"Invalid Origin" in init_body:
+        raise AssertionError(f"initialize rejected Origin: {init_status} {init_body!r}")
     if init_status != 200 or "application/json" not in init_headers.get("content-type", ""):
         raise AssertionError(f"initialize {init_status} {init_headers.get('content-type')}: {init_body!r}")
     capabilities = json.loads(init_body.decode())["result"]["capabilities"]
@@ -583,6 +621,46 @@ def _drain(proc: subprocess.Popen[str]) -> str:
             break
         time.sleep(0.05)
     return "".join(chunks)
+
+
+def test_sesame_origin_is_removed_before_the_sdk() -> None:
+    from desktop_agent.control.pc_control.http_server import (
+        _drop_accepted_origin,
+        accepted_browser_origins,
+        build_http_app,
+    )
+
+    origins = accepted_browser_origins()
+    assert "https://sesameai.app" in origins
+    assert "https://aetherbridge.a.pinggy.link" in origins
+    scope = {
+        "type": "http",
+        "headers": [
+            (b"host", b"aetherbridge.a.pinggy.link"),
+            (b"origin", b"https://sesameai.app"),
+        ],
+    }
+    dropped = _drop_accepted_origin(scope)
+    assert all(key.lower() != b"origin" for key, _value in dropped["headers"])
+    kept = _drop_accepted_origin(
+        {
+            "type": "http",
+            "headers": [(b"origin", b"https://evil.example")],
+        }
+    )
+    assert _header_value(kept, b"origin") == "https://evil.example"
+    app = build_http_app()
+    settings = app.state.pc_session_manager.security_settings
+    assert settings.enable_dns_rebinding_protection is False
+    assert "https://sesameai.app" in settings.allowed_origins
+    assert "aetherbridge.a.pinggy.link" in settings.allowed_hosts
+
+
+def _header_value(scope: dict, name: bytes) -> str | None:
+    for key, value in scope["headers"]:
+        if key.lower() == name:
+            return value.decode()
+    return None
 
 
 def test_default_port_is_not_memory() -> None:

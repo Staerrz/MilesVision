@@ -129,6 +129,7 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(site) + os.pathsep + env.get("PYTHONPATH", "")
     env["PC_CONTROL_HTTP_PORT"] = str(port)
+    env["PC_CONTROL_OAUTH_PATH"] = str(tmp_path / "pc-oauth.json")
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         [sys.executable, "-m", "pc_control.server"],
@@ -187,11 +188,39 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         rest = _drain(proc)
         log = output + rest
         assert "tools/call click" in rest
-        assert "Terminating session: None" not in log
-        ended = log.find("Terminating session:")
-        if ended != -1:
-            assert ended > log.find("tools/call click")
+        assert "Terminating session:" not in log
+        assert pinggy["second_call"] == 200
+        assert pinggy["after_delete"] == 200
+        assert pinggy["stale_session"] == 200
+        assert pinggy["missing_session"] == 200
         assert proc.poll() is None
+        token = pinggy["access_token"]
+        proc.terminate()
+        proc.wait(timeout=5)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pc_control.server"],
+            cwd=CONTROL,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        deadline = time.time() + 20
+        restarted = ""
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                restarted += proc.stdout.read() if proc.stdout else ""
+                raise AssertionError(f"restarted listener exited {proc.returncode}: {restarted}")
+            line = proc.stdout.readline() if proc.stdout else ""
+            restarted += line
+            if f"http://{HOST}:{port}{HTTP_PATH}" in restarted:
+                break
+        else:
+            raise AssertionError(f"restarted listener did not stay up: {restarted}")
+        again = _call_click(port, token, session=None)
+        assert again[0] == 200, again
+        assert b"dry_run" in again[2]
+        assert "Terminating session:" not in restarted
     finally:
         proc.terminate()
         try:
@@ -221,6 +250,81 @@ async def _listed_and_called(port: int, access_token: str):
                     {"command": "notepad.exe", "dry_run": False},
                 )
     return names, _payload(click), _payload(refused)
+
+
+def _call_click(port: int, token: str, session: str | None) -> tuple[int, dict[str, str], bytes]:
+    import http.client
+    import json
+
+    headers = {
+        "Host": "aetherbridge.a.pinggy.link",
+        "Origin": "https://sesameai.app",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "mcp-protocol-version": "2025-11-25",
+    }
+    if session:
+        headers["mcp-session-id"] = session
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "click",
+                "arguments": {"window": "Notepad", "target": "12", "dry_run": True},
+            },
+        }
+    ).encode()
+    posted = http.client.HTTPConnection(HOST, port, timeout=5)
+    posted.request("POST", HTTP_PATH, body=body, headers=headers)
+    response = posted.getresponse()
+    status = response.status
+    header_map = {name.lower(): value for name, value in response.getheaders()}
+    raw = response.read()
+    posted.close()
+    return status, header_map, raw
+
+
+def test_oauth_clients_and_tokens_survive_a_new_provider(tmp_path: Path) -> None:
+    import asyncio
+
+    from desktop_agent.control.pc_control.oauth import LocalDesktopOAuth
+
+    path = tmp_path / "pc-oauth.json"
+
+    async def issue() -> str:
+        provider = LocalDesktopOAuth(path)
+        client = await provider.remember_public_client(
+            "fGTSoieUnojA4VEH36u1nRV5mBtM57E4",
+            "https://sesameai.app/api/oauth/external-mcp/callback",
+        )
+        await provider.load_access_token("sesame-stored-empty-scope")
+        from mcp.server.auth.provider import AuthorizationParams
+        from pydantic import AnyUrl
+
+        await provider.authorize(
+            client,
+            AuthorizationParams(
+                state="s",
+                scopes=[],
+                code_challenge="challenge",
+                redirect_uri=AnyUrl("https://sesameai.app/api/oauth/external-mcp/callback"),
+                redirect_uri_provided_explicitly=True,
+                resource="https://aetherbridge.a.pinggy.link/mcp",
+            ),
+        )
+        issued = provider._issue(client.client_id or "", [], "https://aetherbridge.a.pinggy.link/mcp")
+        return issued.access_token
+
+    token = asyncio.run(issue())
+    reloaded = LocalDesktopOAuth(path)
+    assert "fGTSoieUnojA4VEH36u1nRV5mBtM57E4" in reloaded._clients
+    assert token in reloaded._access
+    assert reloaded._access[token].expires_at is None
+    assert "sesame-stored-empty-scope" in reloaded._access
+    assert path.stat().st_mode & 0o077 == 0
 
 
 def _payload(result) -> dict:
@@ -509,6 +613,85 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     )
     if alias_status != 200 or b"dry_run" not in alias_body:
         raise AssertionError(f"pc_click alias {alias_status}: {alias_body!r}")
+    second_status, _second_headers, second_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "click",
+                    "arguments": {"window": "Notepad", "target": "12", "dry_run": True},
+                },
+            }
+        ).encode(),
+        headers=with_session,
+    )
+    if second_status != 200 or b"dry_run" not in second_body:
+        raise AssertionError(f"second tools/call {second_status}: {second_body!r}")
+    deleted_status, _deleted_headers, _deleted_body = request(
+        "DELETE",
+        HTTP_PATH,
+        headers=with_session,
+    )
+    if deleted_status in (404, 403):
+        raise AssertionError(f"DELETE {deleted_status}")
+    after_status, _after_headers, after_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "type",
+                    "arguments": {"window": "Notepad", "target": "12", "text": "hi", "dry_run": True},
+                },
+            }
+        ).encode(),
+        headers=with_session,
+    )
+    if after_status != 200 or b"dry_run" not in after_body:
+        raise AssertionError(f"tools/call after DELETE {after_status}: {after_body!r}")
+    stale_status, _stale_headers, stale_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "click",
+                    "arguments": {"window": "Notepad", "target": "12", "dry_run": True},
+                },
+            }
+        ).encode(),
+        headers={**bearer, "mcp-session-id": "dead-session"},
+    )
+    if stale_status in (404, 403) or stale_status != 200 or b"dry_run" not in stale_body:
+        raise AssertionError(f"stale session tools/call {stale_status}: {stale_body!r}")
+    missing_status, _missing_headers, missing_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "click",
+                    "arguments": {"window": "Notepad", "target": "12", "dry_run": True},
+                },
+            }
+        ).encode(),
+        headers=bearer,
+    )
+    if missing_status in (404, 403) or missing_status != 200 or b"dry_run" not in missing_body:
+        raise AssertionError(f"missing session tools/call {missing_status}: {missing_body!r}")
     modern_status, modern_headers, modern_body = request(
         "POST",
         HTTP_PATH,
@@ -573,6 +756,10 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         "www_authenticate": www,
         "stored_tools": stored_tools,
         "negotiated_protocol": negotiated_protocol,
+        "second_call": second_status,
+        "after_delete": after_status,
+        "stale_session": stale_status,
+        "missing_session": missing_status,
     }
 
 

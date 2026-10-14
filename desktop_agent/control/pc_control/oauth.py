@@ -12,8 +12,11 @@ its port is not used.
 from __future__ import annotations
 
 import html
+import json
+import os
 import secrets
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from mcp.server.auth.provider import (
@@ -43,6 +46,20 @@ _AUTHORIZE_FIELDS = (
     "scope",
     "resource",
 )
+
+
+def oauth_store_path() -> Path:
+    """Where clients and access tokens survive a process restart.
+
+    ``PC_CONTROL_OAUTH_PATH`` overrides it. The default is outside the repo
+    so a restart does not forget the token Sesame already stored.
+    """
+    from .envvars import get as pc_env
+
+    raw = pc_env("OAUTH_PATH")
+    if raw is not None and str(raw).strip():
+        return Path(str(raw).strip())
+    return Path.home() / ".milesvision" / "pc-oauth.json"
 
 
 def public_origin() -> str:
@@ -80,13 +97,20 @@ def resource_matches(resource: str, origin: str | None = None) -> bool:
 class LocalDesktopOAuth(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """In-process authorization server. Approval on ``/authorize`` issues the code."""
+    """In-process authorization server. Approval on ``/authorize`` issues the code.
 
-    def __init__(self) -> None:
+    Clients, authorization codes, access tokens, and refresh tokens are written
+    to ``oauth_store_path`` on every change and read back when the process
+    starts. A restart does not require a new approval.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path or oauth_store_path()
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._codes: dict[str, AuthorizationCode] = {}
         self._access: dict[str, AccessToken] = {}
         self._refresh: dict[str, RefreshToken] = {}
+        self._load()
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self._clients.get(client_id)
@@ -95,6 +119,7 @@ class LocalDesktopOAuth(
         if client_info.client_id is None:
             raise ValueError("client_id is required")
         self._clients[client_info.client_id] = client_info
+        self._save()
 
     async def remember_public_client(self, client_id: str, redirect_uri: str) -> OAuthClientInformationFull:
         """Keep a public PKCE client that never called ``/register`` on this process.
@@ -149,6 +174,7 @@ class LocalDesktopOAuth(
             resource=params.resource,
             subject="desktop",
         )
+        self._save()
         return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
 
     async def load_authorization_code(
@@ -195,15 +221,19 @@ class LocalDesktopOAuth(
             return None
         found = self._access.get(token)
         if found is None:
-            return AccessToken(
+            found = AccessToken(
                 token=token,
                 client_id="stored",
                 scopes=[],
                 subject="desktop",
             )
-        if found.scopes:
-            found = found.model_copy(update={"scopes": []})
             self._access[token] = found
+            self._save()
+            return found
+        if found.scopes or found.expires_at is not None:
+            found = found.model_copy(update={"scopes": [], "expires_at": None})
+            self._access[token] = found
+            self._save()
         return found
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
@@ -211,6 +241,58 @@ class LocalDesktopOAuth(
             self._access.pop(token.token, None)
         else:
             self._refresh.pop(token.token, None)
+        self._save()
+
+    def _load(self) -> None:
+        """Read the on-disk store. A missing or unreadable file starts empty."""
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        clients = payload.get("clients")
+        codes = payload.get("codes")
+        access = payload.get("access")
+        refresh = payload.get("refresh")
+        if isinstance(clients, dict):
+            for key, value in clients.items():
+                if isinstance(value, dict):
+                    self._clients[key] = OAuthClientInformationFull.model_validate(value)
+        if isinstance(codes, dict):
+            for key, value in codes.items():
+                if isinstance(value, dict):
+                    self._codes[key] = AuthorizationCode.model_validate(value)
+        if isinstance(access, dict):
+            for key, value in access.items():
+                if isinstance(value, dict):
+                    token = AccessToken.model_validate(value)
+                    if token.expires_at is not None or token.scopes:
+                        token = token.model_copy(update={"scopes": [], "expires_at": None})
+                    self._access[key] = token
+        if isinstance(refresh, dict):
+            for key, value in refresh.items():
+                if isinstance(value, dict):
+                    item = RefreshToken.model_validate(value)
+                    if item.expires_at is not None:
+                        item = item.model_copy(update={"expires_at": None})
+                    self._refresh[key] = item
+
+    def _save(self) -> None:
+        """Atomically replace the store. Mode 600. Tokens are not logged."""
+        payload = {
+            "clients": {key: value.model_dump(mode="json") for key, value in self._clients.items()},
+            "codes": {key: value.model_dump(mode="json") for key, value in self._codes.items()},
+            "access": {key: value.model_dump(mode="json") for key, value in self._access.items()},
+            "refresh": {key: value.model_dump(mode="json") for key, value in self._refresh.items()},
+        }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(self._path)
+        os.chmod(self._path, 0o600)
 
     def _issue(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
         # Sesame's authorize request sends no scope. Do not invent tool-name
@@ -223,7 +305,7 @@ class LocalDesktopOAuth(
             token=access,
             client_id=client_id,
             scopes=scopes,
-            expires_at=int(time.time()) + 3600,
+            expires_at=None,
             resource=resource,
             subject="desktop",
         )
@@ -231,10 +313,11 @@ class LocalDesktopOAuth(
             token=refresh,
             client_id=client_id,
             scopes=scopes,
-            expires_at=int(time.time()) + 86400,
+            expires_at=None,
             resource=resource,
             subject="desktop",
         )
+        self._save()
         return OAuthToken(
             access_token=access,
             token_type="Bearer",

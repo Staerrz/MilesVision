@@ -602,16 +602,40 @@ async def _send_json(send: Any, body: bytes, session: str | None) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+def _invoke_tool(name: str, arguments: Any) -> dict[str, Any]:
+    """Run one bridge tool. Extra arguments such as ``confirm`` are ignored.
+
+    The HTTP status stays 200. A missing or stale session id is not a 404.
+    """
+    import json
+
+    if not isinstance(arguments, dict):
+        arguments = {}
+    try:
+        fn = bridge_callable(str(name))
+    except RuntimeError:
+        return {"error": {"code": -32602, "message": f"Unknown tool: {name}"}}
+    accepted = set(inspect.signature(fn).parameters)
+    kwargs = {key: value for key, value in arguments.items() if key in accepted}
+    try:
+        outcome = fn(**kwargs)
+    except Exception as exc:
+        text = json.dumps({"ok": False, "error": str(exc)})
+        return {"result": {"content": [{"type": "text", "text": text}], "isError": True}}
+    text = json.dumps(outcome)
+    return {"result": {"content": [{"type": "text", "text": text}], "isError": False}}
+
+
 def _keep_process_session(manager: Any, path: str) -> None:
     """Keep the session initialize created, and return its id.
 
     ``initialize`` answers with ``Mcp-Session-Id`` and the protocol version
     the client sent. ``tools/list`` returns every registered tool and is not
-    filtered by token scope. A later ``tools/call`` that sends the session id
-    is handled. A POST with no session id is attached to the same session.
+    filtered by token scope. ``tools/call`` runs on this process and does not
+    end the session. ``DELETE`` does not end it either. A later ``tools/call``
+    with a stale or missing session id still runs when the bearer is valid.
     A classic JSON-RPC body is served on the handshake session so a modern
-    header does not skip tool loading. A stale id from an earlier process is
-    dropped only when this process has no session yet.
+    header does not skip tool loading.
     """
     original = manager.asgi_app
 
@@ -619,6 +643,12 @@ def _keep_process_session(manager: Any, path: str) -> None:
         if scope.get("type") == "http" and scope.get("path", "").rstrip("/") == path.rstrip("/"):
             if scope.get("method") == "OPTIONS":
                 await _send_cors(send, 204)
+                return
+            if scope.get("method") == "DELETE":
+                # The MCP client sends DELETE when a call's connection closes.
+                # Forwarding it terminates the session, and the next POST with
+                # that id is rejected. The session stays for the process.
+                await _send_json(send, b"null", _live_session_id(manager))
                 return
             scope = _drop_accepted_origin(scope)
             headers = list(scope.get("headers") or [])
@@ -644,12 +674,19 @@ def _keep_process_session(manager: Any, path: str) -> None:
                 ).encode()
                 await _send_json(send, encoded, _live_session_id(manager))
                 return
-            if method == "initialize":
-                _log_mcp("initialize")
-            elif method == "tools/call":
+            if method == "tools/call":
                 params = payload.get("params") if payload else None
                 name = params.get("name") if isinstance(params, dict) else ""
+                arguments = params.get("arguments") if isinstance(params, dict) else {}
                 _log_mcp(f"tools/call {name}")
+                import json
+
+                answered = {"jsonrpc": "2.0", "id": payload.get("id") if payload else None}
+                answered.update(_invoke_tool(str(name or ""), arguments))
+                await _send_json(send, json.dumps(answered).encode(), _live_session_id(manager))
+                return
+            if method == "initialize":
+                _log_mcp("initialize")
             header_version = _header(headers, b"mcp-protocol-version")
             if (
                 payload
@@ -742,10 +779,9 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
     manager's ``run()``, entered when uvicorn starts and left when it stops.
     Requests do not build another manager.
 
-    JSON responses stay on. ``initialize`` sets ``Mcp-Session-Id`` and that
-    session is not terminated after initialize or tools/list. A later
-    tools/call that sends the id is served. A request that omits the id still
-    reaches the same session.
+    JSON responses stay on. ``initialize`` sets ``Mcp-Session-Id``. That
+    session is not terminated by ``tools/call`` or by ``DELETE``. A later
+    ``tools/call`` with the same id, a stale id, or no id still runs the tool.
     DNS-rebinding protection is off, the same way a tunneled host such as
     ``aetherbridge.a.pinggy.link`` is allowed through to Miles Memory.
     ``Origin`` is still allowlisted and removed for Sesame

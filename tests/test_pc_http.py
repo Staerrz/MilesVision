@@ -105,6 +105,9 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         assert pinggy["token_route_status"] != 404
         assert pinggy["protected_resource_status"] == 200
         assert pinggy["tools"] == list(EXPECTED)
+        assert pinggy["capabilities"].get("tools") == {}
+        assert "prompts" not in pinggy["capabilities"]
+        assert "resources" not in pinggy["capabilities"]
         assert pinggy["sesame_authorize_status"] == 200
         assert pinggy["sesame_token_before_code"] == 401
         assert pinggy["sesame_access_token"]
@@ -304,7 +307,67 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     )
     if listed_status != 200:
         raise AssertionError(f"tools/list {listed_status}: {listed_body!r}")
+    if "application/json" not in _listed_headers.get("content-type", ""):
+        raise AssertionError(f"tools/list content-type {_listed_headers.get('content-type')!r}")
+    if listed_body.startswith(b"event:") or listed_body.startswith(b":"):
+        raise AssertionError(f"tools/list was SSE: {listed_body[:200]!r}")
     listed = json.loads(listed_body.decode())
+    init_status, init_headers, init_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "miles", "version": "0"},
+                },
+            }
+        ).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
+    if init_status != 200 or "application/json" not in init_headers.get("content-type", ""):
+        raise AssertionError(f"initialize {init_status} {init_headers.get('content-type')}: {init_body!r}")
+    capabilities = json.loads(init_body.decode())["result"]["capabilities"]
+    if not isinstance(capabilities.get("tools"), dict):
+        raise AssertionError(f"initialize capabilities {capabilities!r}")
+    for tool in listed["result"]["tools"]:
+        schema = tool.get("inputSchema")
+        if not tool.get("name") or not tool.get("description") or not isinstance(schema, dict):
+            raise AssertionError(f"tool shape {tool!r}")
+        if schema.get("type") != "object" or "anyOf" in json.dumps(schema):
+            raise AssertionError(f"inputSchema {schema!r}")
+    called_status, called_headers, called_body = request(
+        "POST",
+        HTTP_PATH,
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "pc_click", "arguments": {"window": "Notepad", "target": "12", "dry_run": True}},
+            }
+        ).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "mcp-protocol-version": "2025-11-25",
+        },
+    )
+    if called_status != 200 or "application/json" not in called_headers.get("content-type", ""):
+        raise AssertionError(f"tools/call {called_status}: {called_body!r}")
+    called = json.loads(called_body.decode())
+    called_text = json.dumps(called)
+    if "dry_run" not in called_text or called.get("error"):
+        raise AssertionError(f"tools/call did not reach the bridge: {called!r}")
     sesame = _sesame_unknown_client(request)
     www = unauthenticated_headers.get("www-authenticate", "")
     return {
@@ -314,6 +377,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         "protected_resource_status": protected_status,
         "access_token": access_token,
         "tools": [tool["name"] for tool in listed["result"]["tools"]],
+        "capabilities": capabilities,
         "sesame_authorize_status": sesame["authorize_status"],
         "sesame_token_before_code": sesame["token_before_code"],
         "sesame_access_token": sesame["access_token"],

@@ -64,11 +64,71 @@ def registered_tools() -> tuple[Callable[..., Any], ...]:
     return tuple(tools)
 
 
+def plain_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Object schema a client can keep: type, properties, required.
+
+    ``bool | None`` becomes a boolean property and stays optional, so ``dry_run``
+    is still omitted by default. ``anyOf`` null unions are what get a whole tool
+    list dropped before ``tools/call`` is ever sent.
+    """
+    properties: dict[str, Any] = {}
+    for name, prop in (schema.get("properties") or {}).items():
+        if not isinstance(prop, dict):
+            continue
+        entry: dict[str, Any] = {"type": _json_type(prop)}
+        description = prop.get("description")
+        if isinstance(description, str) and description.strip():
+            entry["description"] = description
+        properties[name] = entry
+    required = [name for name in (schema.get("required") or []) if name in properties]
+    published: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        published["required"] = required
+    return published
+
+
+def _json_type(prop: dict[str, Any]) -> str:
+    declared = prop.get("type")
+    if isinstance(declared, str) and declared != "null":
+        return declared
+    for option in prop.get("anyOf") or []:
+        if isinstance(option, dict) and isinstance(option.get("type"), str) and option["type"] != "null":
+            return option["type"]
+    return "string"
+
+
+def _advertise_tools_only(server: Any) -> None:
+    """``initialize`` capabilities are exactly ``{"tools": {}}``.
+
+    Prompt and resource handlers are registered by the SDK even when this
+    process has none. Advertising them, or ``tools.listChanged``, is not a
+    tool list. Clients that do not see a tools object never call ``tools/list``.
+    """
+    from mcp_types import ToolsCapability
+
+    low = server._lowlevel_server
+    original = low.get_capabilities
+
+    def get_capabilities(*args: Any, **kwargs: Any) -> Any:
+        caps = original(*args, **kwargs)
+        caps.experimental = None
+        caps.logging = None
+        caps.prompts = None
+        caps.resources = None
+        caps.completions = None
+        caps.tasks = None
+        caps.tools = ToolsCapability()
+        return caps
+
+    low.get_capabilities = get_capabilities
+
+
 def build_server() -> Any:
     """An MCP server whose tools/list is exactly ``registered_tools``.
 
     OAuth stays on. Unauthenticated ``/mcp`` is 401. A bearer token from
-    ``/token`` is what ``tools/list`` accepts.
+    ``/token`` is what ``tools/list`` accepts. ``initialize`` advertises
+    ``capabilities.tools`` and nothing else.
     """
     try:
         from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -78,12 +138,14 @@ def build_server() -> Any:
             "The PC control listener needs the mcp package (2.x). "
             "Install it with: python -m pip install 'mcp>=2'"
         ) from exc
+    from . import __version__
     from .oauth import LocalDesktopOAuth, public_origin
 
     origin = public_origin()
     provider = LocalDesktopOAuth()
     server = MCPServer(
         "desktop-agent-pc",
+        version=__version__,
         auth=AuthSettings(
             issuer_url=origin,
             resource_server_url=origin,
@@ -96,6 +158,13 @@ def build_server() -> Any:
     server.pc_oauth = provider
     for fn in registered_tools():
         server.add_tool(fn, structured_output=False)
+        tool = server._tool_manager.get_tool(fn.__name__)
+        if tool is None:
+            raise RuntimeError(f"{fn.__name__} was not registered")
+        tool.parameters = plain_input_schema(tool.parameters)
+        if not (tool.description or "").strip():
+            tool.description = tool.name
+    _advertise_tools_only(server)
     return server
 
 

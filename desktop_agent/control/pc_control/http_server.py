@@ -303,17 +303,22 @@ def build_server() -> Any:
             "Install it with: python -m pip install 'mcp>=2'"
         ) from exc
     from . import __version__
-    from .oauth import LocalDesktopOAuth, public_origin
+    from .oauth import LocalDesktopOAuth, public_origin, tool_scopes
 
     origin = public_origin()
     provider = LocalDesktopOAuth()
+    scopes = tool_scopes()
     server = MCPServer(
         "desktop-agent-pc",
         version=__version__,
         auth=AuthSettings(
             issuer_url=origin,
             resource_server_url=origin,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=scopes,
+                default_scopes=scopes,
+            ),
             required_scopes=[],
             validate_token_resource=False,
         ),
@@ -367,6 +372,42 @@ def _install_confirm_authorize(app: Any, provider: Any) -> None:
             routes[index] = replacement
             return
     raise RuntimeError("PC control listener is missing /authorize")
+
+
+def _install_tool_scope_metadata(app: Any) -> None:
+    """Publish tool scopes on the protected-resource document.
+
+    The SDK copies ``required_scopes`` into that document. Those stay empty so
+    a bearer token is not turned into 403. The document itself still lists
+    ``windows``, ``look``, ``click``, and ``type`` so a client does not treat
+    the tool permission set as omitted.
+    """
+    from urllib.parse import urlparse
+
+    from mcp.server.auth.handlers.metadata import ProtectedResourceMetadataHandler
+    from mcp.server.auth.routes import build_resource_metadata_url, cors_middleware
+    from mcp.shared.auth import ProtectedResourceMetadata
+    from pydantic import AnyHttpUrl
+    from starlette.routing import Route
+
+    from .oauth import public_origin, tool_scopes
+
+    origin = AnyHttpUrl(public_origin())
+    metadata = ProtectedResourceMetadata(
+        resource=origin,
+        authorization_servers=[origin],
+        scopes_supported=tool_scopes(),
+        resource_name="PC control",
+    )
+    endpoint = cors_middleware(ProtectedResourceMetadataHandler(metadata).handle, ["GET", "OPTIONS"])
+    path = urlparse(str(build_resource_metadata_url(origin))).path
+    replacement = Route(path, endpoint=endpoint, methods=["GET", "OPTIONS"])
+    routes = app.router.routes
+    for index, route in enumerate(routes):
+        if getattr(route, "path", None) == path:
+            routes[index] = replacement
+            return
+    routes.insert(0, replacement)
 
 
 def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> str | None:
@@ -425,6 +466,44 @@ def _drop_accepted_origin(scope: dict[str, Any]) -> dict[str, Any]:
     scope = dict(scope)
     scope["headers"] = _drop_header(headers, b"origin")
     return scope
+
+
+class _AdvertiseToolScopes:
+    """Tell a client which tool scopes to request.
+
+    ``WWW-Authenticate`` on 401 otherwise has no ``scope``. A client then
+    treats the protected-resource list as empty and can hide tools after a
+    200 initialize. Unauthenticated ``POST /mcp`` stays 401.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        async def send_challenge(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start" and message.get("status") == 401:
+                message = dict(message)
+                message["headers"] = _with_tool_scope(list(message.get("headers") or []))
+            await send(message)
+
+        await self.app(scope, receive, send_challenge)
+
+
+def _with_tool_scope(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    from .oauth import tool_scopes
+
+    parameter = f'scope="{" ".join(tool_scopes())}"'.encode()
+    updated: list[tuple[bytes, bytes]] = []
+    found = False
+    for key, value in headers:
+        if key.lower() == b"www-authenticate":
+            found = True
+            if b"scope=" not in value:
+                value = value + b", " + parameter
+        updated.append((key, value))
+    if not found:
+        updated.append((b"www-authenticate", b"Bearer " + parameter))
+    return updated
 
 
 class _PassthroughAcceptedOrigin:
@@ -574,8 +653,10 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
             allowed_origins=sorted(accepted_browser_origins()),
         ),
     )
+    app.add_middleware(_AdvertiseToolScopes)
     app.add_middleware(_PassthroughAcceptedOrigin)
     _install_confirm_authorize(app, server.pc_oauth)
+    _install_tool_scope_metadata(app)
     manager = server.session_manager
     if manager.stateless or not manager.json_response or manager.session_idle_timeout is not None:
         raise RuntimeError("PC control listener must keep one JSON session for the process")

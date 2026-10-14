@@ -45,6 +45,23 @@ _AUTHORIZE_FIELDS = (
 )
 
 
+def tool_scopes() -> list[str]:
+    """Scopes for the PC-Control tools, including windows, look, click, and type.
+
+    These are not a secret. A client that hides tools when the token or the
+    metadata omits a scope still receives them on every issued token.
+    """
+    import sys
+    from pathlib import Path
+
+    root = str(Path(__file__).resolve().parents[3])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from desktop_agent.bridge.pc import SOURCE_NAMES
+
+    return list(SOURCE_NAMES)
+
+
 def public_origin() -> str:
     """Public HTTPS origin Sesame uses. ``PC_CONTROL_PUBLIC_ORIGIN`` overrides it."""
     from .envvars import get as pc_env
@@ -192,6 +209,11 @@ class LocalDesktopOAuth(
             self._refresh.pop(token.token, None)
 
     def _issue(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
+        granted = [scope for scope in scopes if scope]
+        for name in tool_scopes():
+            if name not in granted:
+                granted.append(name)
+        scopes = granted
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
         self._access[access] = AccessToken(

@@ -151,6 +151,21 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         assert pinggy["sesame_authorize_status"] == 200
         assert pinggy["sesame_token_before_code"] == 401
         assert pinggy["sesame_access_token"]
+        visible = ("windows", "look", "click", "type")
+        for name in visible:
+            assert name in pinggy["tools"]
+            fields = pinggy["tool_fields"][name]
+            assert fields["title"] and fields["description"] and fields["inputSchema"]
+        for scopes in (
+            pinggy["token_scopes"],
+            pinggy["sesame_scopes"],
+            pinggy["protected_scopes"],
+            pinggy["authorization_scopes"],
+        ):
+            assert list(scopes[:4]) == list(visible)
+            for name in visible:
+                assert name in scopes
+        assert 'scope="windows look click type' in pinggy["www_authenticate"]
         names, click, refused = asyncio.run(_listed_and_called(port, pinggy["access_token"]))
         assert names == list(EXPECTED)
         assert click["ok"] is True
@@ -270,6 +285,11 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     protected_status, _protected_headers, protected_body = request("GET", "/.well-known/oauth-protected-resource")
     if protected_status != 200:
         raise AssertionError(f"protected resource {protected_status}: {protected_body!r}")
+    protected_scopes = json.loads(protected_body.decode()).get("scopes_supported") or []
+    as_status, _as_headers, as_body = request("GET", "/.well-known/oauth-authorization-server")
+    if as_status != 200:
+        raise AssertionError(f"authorization server {as_status}: {as_body!r}")
+    authorization_scopes = json.loads(as_body.decode()).get("scopes_supported") or []
 
     registered_status, _registered_headers, registered_body = request(
         "POST",
@@ -342,7 +362,9 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     )
     if issued_status != 200:
         raise AssertionError(f"token {issued_status}: {issued_body!r}")
-    access_token = json.loads(issued_body.decode())["access_token"]
+    issued = json.loads(issued_body.decode())
+    access_token = issued["access_token"]
+    token_scopes = (issued.get("scope") or "").split()
     bearer = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -490,12 +512,25 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         "www_authenticate_has_metadata": f'resource_metadata="{metadata}"' in www,
         "token_route_status": token_route_status,
         "protected_resource_status": protected_status,
+        "protected_scopes": protected_scopes,
+        "authorization_scopes": authorization_scopes,
+        "token_scopes": token_scopes,
         "access_token": access_token,
         "tools": [tool["name"] for tool in listed["result"]["tools"]],
+        "tool_fields": {
+            name: {
+                "title": by_name[name].get("title"),
+                "description": by_name[name].get("description"),
+                "inputSchema": by_name[name].get("inputSchema"),
+            }
+            for name in ("windows", "look", "click", "type")
+        },
         "capabilities": capabilities,
         "sesame_authorize_status": sesame["authorize_status"],
         "sesame_token_before_code": sesame["token_before_code"],
         "sesame_access_token": sesame["access_token"],
+        "sesame_scopes": sesame["scopes"],
+        "www_authenticate": www,
     }
 
 
@@ -585,10 +620,12 @@ def _sesame_unknown_client(request) -> dict:
     )
     if issued_status != 200:
         raise AssertionError(f"sesame token {issued_status}: {issued_body!r}")
+    issued = json.loads(issued_body.decode())
     return {
         "authorize_status": page_status,
         "token_before_code": before_status,
-        "access_token": json.loads(issued_body.decode())["access_token"],
+        "access_token": issued["access_token"],
+        "scopes": (issued.get("scope") or "").split(),
     }
 
 

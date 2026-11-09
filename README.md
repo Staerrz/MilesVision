@@ -132,7 +132,7 @@ python -m pc_control.server
 ```
 
 That stays up at `http://127.0.0.1:8770/mcp` and answers JSON. `initialize` sets `mcp-session-id`, and that id stays valid, so a later `tools/call` that sends it runs. A call with no `mcp-session-id` still reaches the same session. Tool descriptions list the argument names. Pinggy's host
-`aetherbridge.a.pinggy.link` is accepted. OAuth stays on: an unauthenticated
+`vision.miles-n-erica.win` is accepted. OAuth stays on: an unauthenticated
 `POST /mcp` is 401. `GET /authorize` for a public PKCE client is a 200 confirm
 page, including a client id that was registered on another process.
 `redirect_uri` `https://sesameai.app/api/oauth/external-mcp/callback` and a

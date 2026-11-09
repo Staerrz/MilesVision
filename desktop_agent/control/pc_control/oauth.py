@@ -32,7 +32,7 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-DEFAULT_PUBLIC_ORIGIN = "https://aetherbridge.a.pinggy.link"
+DEFAULT_PUBLIC_ORIGIN = "https://vision.miles-n-erica.win"
 RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource"
 SESAME_REDIRECT_URI = "https://sesameai.app/api/oauth/external-mcp/callback"
 _REJECTED_REDIRECT_SCHEMES = {"", "javascript", "data", "file", "vbscript"}

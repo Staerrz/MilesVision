@@ -109,8 +109,8 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
                     "127.0.0.1:*",
                     "localhost:*",
                     "[::1]:*",
-                    "aetherbridge.a.pinggy.link",
-                    "aetherbridge.a.pinggy.link:*",
+                    "vision.miles-n-erica.win",
+                    "vision.miles-n-erica.win:*",
                 ]
                 try:
                     return await _validate(self, request, is_post=is_post)
@@ -257,7 +257,7 @@ def _call_click(port: int, token: str, session: str | None) -> tuple[int, dict[s
     import json
 
     headers = {
-        "Host": "aetherbridge.a.pinggy.link",
+        "Host": "vision.miles-n-erica.win",
         "Origin": "https://sesameai.app",
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -312,10 +312,10 @@ def test_oauth_clients_and_tokens_survive_a_new_provider(tmp_path: Path) -> None
                 code_challenge="challenge",
                 redirect_uri=AnyUrl("https://sesameai.app/api/oauth/external-mcp/callback"),
                 redirect_uri_provided_explicitly=True,
-                resource="https://aetherbridge.a.pinggy.link/mcp",
+                resource="https://vision.miles-n-erica.win/mcp",
             ),
         )
-        issued = provider._issue(client.client_id or "", [], "https://aetherbridge.a.pinggy.link/mcp")
+        issued = provider._issue(client.client_id or "", [], "https://vision.miles-n-erica.win/mcp")
         return issued.access_token
 
     token = asyncio.run(issue())
@@ -341,7 +341,7 @@ def _payload(result) -> dict:
 
 
 def _pinggy_oauth_roundtrip(port: int) -> dict:
-    """Host aetherbridge.a.pinggy.link must be 401 on /mcp, not 421, and /token must exist."""
+    """Host vision.miles-n-erica.win must be 401 on /mcp, not 421, and /token must exist."""
     import base64
     import hashlib
     import http.client
@@ -351,7 +351,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
 
     from desktop_agent.control.pc_control.oauth import DEFAULT_PUBLIC_ORIGIN, resource_metadata_url
 
-    tunnel_host = "aetherbridge.a.pinggy.link"
+    tunnel_host = "vision.miles-n-erica.win"
     metadata = resource_metadata_url(DEFAULT_PUBLIC_ORIGIN)
 
     def request(
@@ -773,7 +773,7 @@ def _sesame_unknown_client(request) -> dict:
 
     client_id = "fGTSoieUnojA4VEH36u1nRV5mBtM57E4"
     redirect_uri = "https://sesameai.app/api/oauth/external-mcp/callback"
-    resource = "https://aetherbridge.a.pinggy.link/mcp"
+    resource = "https://vision.miles-n-erica.win/mcp"
     state = "v1.gAAAA" + ("A" * 2048)
     exact = urlencode(
         {
@@ -898,11 +898,11 @@ def test_sesame_origin_is_removed_before_the_sdk() -> None:
 
     origins = accepted_browser_origins()
     assert "https://sesameai.app" in origins
-    assert "https://aetherbridge.a.pinggy.link" in origins
+    assert "https://vision.miles-n-erica.win" in origins
     scope = {
         "type": "http",
         "headers": [
-            (b"host", b"aetherbridge.a.pinggy.link"),
+            (b"host", b"vision.miles-n-erica.win"),
             (b"origin", b"https://sesameai.app"),
         ],
     }
@@ -919,7 +919,7 @@ def test_sesame_origin_is_removed_before_the_sdk() -> None:
     settings = app.state.pc_session_manager.security_settings
     assert settings.enable_dns_rebinding_protection is False
     assert "https://sesameai.app" in settings.allowed_origins
-    assert "aetherbridge.a.pinggy.link" in settings.allowed_hosts
+    assert "vision.miles-n-erica.win" in settings.allowed_hosts
 
 
 def _header_value(scope: dict, name: bytes) -> str | None:
@@ -1033,7 +1033,7 @@ def _mcp_status(port: int) -> int:
             }
         ).encode(),
         headers={
-            "Host": "aetherbridge.a.pinggy.link",
+            "Host": "vision.miles-n-erica.win",
             "Content-Type": "application/json",
             "Accept": "application/json",
         },

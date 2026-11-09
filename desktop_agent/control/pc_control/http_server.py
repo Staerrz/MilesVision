@@ -783,7 +783,7 @@ def build_http_app(host: str = HOST, path: str = HTTP_PATH) -> Any:
     session is not terminated by ``tools/call`` or by ``DELETE``. A later
     ``tools/call`` with the same id, a stale id, or no id still runs the tool.
     DNS-rebinding protection is off, the same way a tunneled host such as
-    ``aetherbridge.a.pinggy.link`` is allowed through to Miles Memory.
+    ``vision.miles-n-erica.win`` is allowed through to Miles Memory.
     ``Origin`` is still allowlisted and removed for Sesame
     (``https://sesameai.app``) and that public origin. The SDK's Origin check
     is the HTTP 403, and it can run after the Host check is off. No handshake

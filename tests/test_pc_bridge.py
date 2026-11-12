@@ -75,7 +75,17 @@ def test_screen_control_off_refuses_open(tmp_path: Path) -> None:
     assert "VISION_ALLOW_SCREEN_CONTROL" in result["outcome"]["reason"]
 
 
-def test_observe_reports_missing_windows_stack(tmp_path: Path) -> None:
+def test_observe_reports_missing_windows_stack(tmp_path: Path, monkeypatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("desktop_agent.control.pc_control"):
+            raise ImportError("mocked missing Windows stack")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
     bridge = _bridge(tmp_path)
     result = bridge.pc_windows("word")
     assert result["tool"] == "pc_windows"

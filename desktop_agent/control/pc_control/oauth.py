@@ -5,7 +5,9 @@ Sesame reaches this process through Pinggy and requires OAuth. The routes are
 ``/.well-known/oauth-authorization-server``, ``/register``, ``/authorize``,
 and ``/token``. ``GET /authorize`` renders a confirm page. An unknown public
 PKCE client is not a 400: the client id may have been registered with another
-process. Approval is what issues the code. Miles Memory is not imported and
+process. Approval is what issues the code, and approval needs the owner PIN
+(see ``approval_pin``); with no PIN set up, nothing is approved. Only bearers
+this server issued are accepted on ``/mcp``. Miles Memory is not imported and
 its port is not used.
 """
 
@@ -32,6 +34,8 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from .approval_pin import ApprovalGuard, ApprovalTickets
+
 DEFAULT_PUBLIC_ORIGIN = "https://vision.miles-n-erica.win"
 RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource"
 SESAME_REDIRECT_URI = "https://sesameai.app/api/oauth/external-mcp/callback"
@@ -46,6 +50,12 @@ _AUTHORIZE_FIELDS = (
     "scope",
     "resource",
 )
+_PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer",
+}
 
 
 def oauth_store_path() -> Path:
@@ -60,6 +70,70 @@ def oauth_store_path() -> Path:
     if raw is not None and str(raw).strip():
         return Path(str(raw).strip())
     return Path.home() / ".milesvision" / "pc-oauth.json"
+
+
+def _open_exclusive(path: Path) -> int:
+    """Create an empty temp file. The returned fd stays open for restrict and write."""
+    if os.name != "nt":
+        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    import msvcrt
+    import ntsecuritycon
+    import win32file
+
+    handle = win32file.CreateFile(
+        str(path),
+        ntsecuritycon.FILE_GENERIC_READ
+        | ntsecuritycon.FILE_GENERIC_WRITE
+        | ntsecuritycon.WRITE_DAC
+        | ntsecuritycon.READ_CONTROL,
+        0,
+        None,
+        win32file.CREATE_NEW,
+        win32file.FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    return msvcrt.open_osfhandle(handle.Detach(), os.O_RDWR | os.O_BINARY)
+
+
+def _owner_only(fd: int) -> None:
+    """Restrict this open fd before any token bytes are written to it."""
+    if os.name != "nt":
+        os.fchmod(fd, 0o600)
+        return
+    import msvcrt
+    import ntsecuritycon
+    import win32security
+
+    handle = msvcrt.get_osfhandle(fd)
+    descriptor = win32security.GetSecurityInfo(
+        handle,
+        win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION,
+    )
+    owner = descriptor.GetSecurityDescriptorOwner()
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, owner
+    )
+    win32security.SetSecurityInfo(
+        handle,
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("token store write did not advance")
+        view = view[written:]
 
 
 def public_origin() -> str:
@@ -209,27 +283,19 @@ class LocalDesktopOAuth(
         return self._issue(client.client_id or "", scopes, refresh_token.resource)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        """Accept a bearer Sesame already stored, including an empty scope.
+        """Accept only a bearer this server issued (it is in the on-disk store).
 
         Tool names are not scopes. A scope list of ``windows look click type``
         can make a client hide tools, so a stored token is presented with no
-        scopes. An unknown bearer is still a token: this process may have
-        restarted since Sesame saved it. A missing Authorization header never
-        reaches this method, so ``POST /mcp`` without a bearer stays 401.
+        scopes. An unknown bearer is refused: the store survives restarts, so
+        a token Sesame saved is still found after one. Accepting unknown
+        bearers let any made-up string through to the tools.
         """
         if not token:
             return None
         found = self._access.get(token)
         if found is None:
-            found = AccessToken(
-                token=token,
-                client_id="stored",
-                scopes=[],
-                subject="desktop",
-            )
-            self._access[token] = found
-            self._save()
-            return found
+            return None
         if found.scopes or found.expires_at is not None:
             found = found.model_copy(update={"scopes": [], "expires_at": None})
             self._access[token] = found
@@ -280,7 +346,7 @@ class LocalDesktopOAuth(
                     self._refresh[key] = item
 
     def _save(self) -> None:
-        """Atomically replace the store. Mode 600. Tokens are not logged."""
+        """Atomically replace the store. Owner-only before token bytes are written."""
         payload = {
             "clients": {key: value.model_dump(mode="json") for key, value in self._clients.items()},
             "codes": {key: value.model_dump(mode="json") for key, value in self._codes.items()},
@@ -289,10 +355,15 @@ class LocalDesktopOAuth(
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_suffix(self._path.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload), encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(self._path)
-        os.chmod(self._path, 0o600)
+        temporary.unlink(missing_ok=True)
+        fd = _open_exclusive(temporary)
+        try:
+            _owner_only(fd)
+            _write_all(fd, json.dumps(payload).encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, self._path)
 
     def _issue(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
         # Sesame's authorize request sends no scope. Do not invent tool-name
@@ -330,21 +401,57 @@ class LocalDesktopOAuth(
 class ConfirmAuthorize:
     """``GET /authorize`` is the confirm page. ``POST`` with ``decision=approve`` issues the code."""
 
-    def __init__(self, provider: LocalDesktopOAuth) -> None:
+    def __init__(
+        self,
+        provider: LocalDesktopOAuth,
+        guard: ApprovalGuard | None = None,
+        tickets: ApprovalTickets | None = None,
+    ) -> None:
         self.provider = provider
+        self.guard = guard or ApprovalGuard()
+        self.tickets = tickets or ApprovalTickets()
 
     async def handle(self, request: Request) -> Response:
         params = await _authorize_params(request)
         error = await self.provider.authorize_error(params)
         if error:
-            return HTMLResponse(f"<p>{html.escape(error)}</p>", status_code=400)
+            return HTMLResponse(f"<p>{html.escape(error)}</p>", status_code=400, headers=_PAGE_HEADERS)
+        binding = ApprovalTickets.binding(params, _AUTHORIZE_FIELDS)
         if request.method == "GET":
-            return HTMLResponse(_approve_page(params), status_code=200)
+            if not self.guard.configured():
+                return HTMLResponse(_not_configured_page(), status_code=503, headers=_PAGE_HEADERS)
+            ticket = self.tickets.issue(binding)
+            return HTMLResponse(_approve_page(params, ticket), status_code=200, headers=_PAGE_HEADERS)
         decision = params.get("decision", "")
         if decision == "deny":
+            self.tickets.consume(params.get("ticket", ""))
             return _finish_redirect(params, {"error": "access_denied", "state": params.get("state") or None})
         if decision != "approve":
-            return HTMLResponse("<p>Confirm or deny the request.</p>", status_code=400)
+            return HTMLResponse("<p>Confirm or deny the request.</p>", status_code=400, headers=_PAGE_HEADERS)
+        ticket = params.get("ticket", "")
+        if not self.tickets.peek(ticket, binding):
+            return HTMLResponse(
+                "<p>This approval form expired or was changed. Start the connection again.</p>",
+                status_code=403,
+                headers=_PAGE_HEADERS,
+            )
+        verdict = self.guard.check(params.get("pin", ""))
+        if verdict == "unset":
+            return HTMLResponse(_not_configured_page(), status_code=503, headers=_PAGE_HEADERS)
+        if verdict == "locked":
+            wait = self.guard.retry_after()
+            return HTMLResponse(
+                f"<p>Too many wrong PINs. Try again in {wait} seconds.</p>",
+                status_code=429,
+                headers={**_PAGE_HEADERS, "Retry-After": str(wait)},
+            )
+        if verdict != "ok":
+            return HTMLResponse(
+                _approve_page(params, ticket, message="Wrong PIN."),
+                status_code=401,
+                headers=_PAGE_HEADERS,
+            )
+        self.tickets.consume(ticket)
         client = await self.provider.remember_public_client(params["client_id"], params["redirect_uri"])
         scopes = [part for part in (params.get("scope") or "").split(" ") if part]
         location = await self.provider.authorize(
@@ -373,15 +480,26 @@ def _finish_redirect(params: dict[str, str], extra: dict[str, str | None]) -> Re
     return RedirectResponse(location, status_code=302, headers={"Cache-Control": "no-store"})
 
 
-def _approve_page(params: dict[str, str]) -> str:
+def _not_configured_page() -> str:
+    return (
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Allow PC control</title></head>"
+        "<body><main><h1>Approval PIN not set up</h1>"
+        "<p>No connection can be approved until the owner sets a PIN on this PC:</p>"
+        "<p><code>python -m desktop_agent.control.pc_control.approval_pin set</code></p>"
+        "</main></body></html>"
+    )
+
+def _approve_page(params: dict[str, str], ticket: str, message: str = "") -> str:
     hidden = []
     for key in _AUTHORIZE_FIELDS:
         value = params.get(key, "")
         hidden.append(
             f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value, quote=True)}">'
         )
+    hidden.append(f'<input type="hidden" name="ticket" value="{html.escape(ticket, quote=True)}">')
     client = html.escape(params.get("client_id", ""))
     redirect = html.escape(params.get("redirect_uri", ""))
+    notice = f'<p role="alert"><strong>{html.escape(message)}</strong></p>' if message else ""
     fields = "\n".join(hidden)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -400,8 +518,10 @@ def _approve_page(params: dict[str, str]) -> str:
 <p>A client wants to connect to this PC control server.</p>
 <p>Client id: {client}</p>
 <p>Return to: {redirect}</p>
+{notice}
 <form method="post" action="/authorize">
 {fields}
+<p><label>Owner PIN <input type="password" name="pin" autocomplete="off" maxlength="128"></label></p>
 <button type="submit" name="decision" value="approve">Allow</button>
 <button type="submit" name="decision" value="deny">Deny</button>
 </form>

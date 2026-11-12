@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -15,6 +16,13 @@ from desktop_agent.control.pc_control.http_server import HOST, HTTP_PATH, PORT, 
 
 CONTROL = Path(__file__).resolve().parents[1] / "desktop_agent" / "control"
 EXPECTED = listed_names()
+_TEST_PIN = "<test pin>"
+
+
+def _approval_pin_file(directory: Path) -> Path:
+    from desktop_agent.control.pc_control import approval_pin
+
+    return approval_pin.save_pin_hash(approval_pin.hash_pin(_TEST_PIN), directory / "approval-pin")
 
 
 def test_one_session_manager_for_the_process_lifespan() -> None:
@@ -61,6 +69,28 @@ def test_registered_names_match_the_bridge() -> None:
     assert callable(getattr(bridge_mod, "keyboard_type"))
 
 
+class _StdoutCapture:
+    """Read a listener pipe on a side thread so a full Windows pipe cannot stall the server."""
+
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        self._lines: list[str] = []
+        self._lock = threading.Lock()
+
+        def _reader() -> None:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                with self._lock:
+                    self._lines.append(line)
+
+        self._thread = threading.Thread(target=_reader, daemon=True)
+        self._thread.start()
+
+    def text(self) -> str:
+        with self._lock:
+            return "".join(self._lines)
+
+
 def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
     port = 18770
     site = tmp_path / "site"
@@ -68,7 +98,7 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
     (site / "sitecustomize.py").write_text(
         textwrap.dedent(
             """
-            import ctypes, sys, types
+            import ctypes, os, sys, types
 
             class _Win:
                 def __getattr__(self, name):
@@ -76,8 +106,9 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
                 def __call__(self, *args, **kwargs):
                     return self
 
-            ctypes.windll = _Win()
-            ctypes.WinDLL = lambda *args, **kwargs: _Win()
+            if os.name != "nt":
+                ctypes.windll = _Win()
+                ctypes.WinDLL = lambda *args, **kwargs: _Win()
 
             def _mod(name):
                 module = types.ModuleType(name)
@@ -130,6 +161,7 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
     env["PYTHONPATH"] = str(site) + os.pathsep + env.get("PYTHONPATH", "")
     env["PC_CONTROL_HTTP_PORT"] = str(port)
     env["PC_CONTROL_OAUTH_PATH"] = str(tmp_path / "pc-oauth.json")
+    env["PC_CONTROL_APPROVAL_PIN_PATH"] = str(_approval_pin_file(tmp_path))
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         [sys.executable, "-m", "pc_control.server"],
@@ -139,19 +171,18 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         stderr=subprocess.STDOUT,
         text=True,
     )
+    pipe = _StdoutCapture(proc)
     try:
         deadline = time.time() + 20
-        output = ""
         while time.time() < deadline:
+            output = pipe.text()
             if proc.poll() is not None:
-                output += proc.stdout.read() if proc.stdout else ""
                 raise AssertionError(f"listener exited {proc.returncode}: {output}")
-            line = proc.stdout.readline() if proc.stdout else ""
-            output += line
             if f"http://{HOST}:{port}{HTTP_PATH}" in output:
                 break
+            time.sleep(0.05)
         else:
-            raise AssertionError(f"listener did not stay up: {output}")
+            raise AssertionError(f"listener did not stay up: {pipe.text()}")
         pinggy = _pinggy_oauth_roundtrip(port)
         assert pinggy["unauthenticated_status"] == 401
         assert pinggy["www_authenticate_has_metadata"]
@@ -176,7 +207,7 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
             assert name not in pinggy["protected_scopes"]
             assert name not in pinggy["authorization_scopes"]
         assert "scope=" not in pinggy["www_authenticate"]
-        assert pinggy["stored_tools"] == list(EXPECTED)
+        assert pinggy["stored_status"] == 401
         assert pinggy["negotiated_protocol"] == "2026-07-28"
         names, click, refused = asyncio.run(_listed_and_called(port, pinggy["access_token"]))
         assert names == list(EXPECTED)
@@ -185,8 +216,8 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
         assert click["outcome"]["executed"] is False
         assert refused["ok"] is False
         assert "VISION_ALLOW_SCREEN_CONTROL" in refused["outcome"]["reason"]
-        rest = _drain(proc)
-        log = output + rest
+        rest = pipe.text()
+        log = rest
         assert "tools/call click" in rest
         assert "Terminating session:" not in log
         assert pinggy["second_call"] == 200
@@ -205,18 +236,17 @@ def test_listener_lists_pc_tools_and_keeps_dry_run(tmp_path: Path) -> None:
             stderr=subprocess.STDOUT,
             text=True,
         )
+        restarted_pipe = _StdoutCapture(proc)
         deadline = time.time() + 20
-        restarted = ""
         while time.time() < deadline:
+            restarted = restarted_pipe.text()
             if proc.poll() is not None:
-                restarted += proc.stdout.read() if proc.stdout else ""
                 raise AssertionError(f"restarted listener exited {proc.returncode}: {restarted}")
-            line = proc.stdout.readline() if proc.stdout else ""
-            restarted += line
             if f"http://{HOST}:{port}{HTTP_PATH}" in restarted:
                 break
+            time.sleep(0.05)
         else:
-            raise AssertionError(f"restarted listener did not stay up: {restarted}")
+            raise AssertionError(f"restarted listener did not stay up: {restarted_pipe.text()}")
         again = _call_click(port, token, session=None)
         assert again[0] == 200, again
         assert b"dry_run" in again[2]
@@ -287,12 +317,110 @@ def _call_click(port: int, token: str, session: str | None) -> tuple[int, dict[s
     return status, header_map, raw
 
 
-def test_oauth_clients_and_tokens_survive_a_new_provider(tmp_path: Path) -> None:
+def _assert_token_file_private(path: Path) -> None:
+    """POSIX mode 0600. On Windows, a protected owner-only DACL."""
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o077 == 0
+        return
+    import ntsecuritycon
+    import win32security
+
+    descriptor = win32security.GetFileSecurity(
+        str(path),
+        win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION,
+    )
+    control, _revision = descriptor.GetSecurityDescriptorControl()
+    assert control & win32security.SE_DACL_PRESENT
+    assert control & win32security.SE_DACL_PROTECTED
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    assert dacl is not None and dacl.GetAceCount() >= 1
+    owner = descriptor.GetSecurityDescriptorOwner()
+    for index in range(dacl.GetAceCount()):
+        (ace_type, ace_flags), mask, sid = dacl.GetAce(index)
+        assert ace_type == ntsecuritycon.ACCESS_ALLOWED_ACE_TYPE
+        assert ace_flags & win32security.INHERITED_ACE == 0
+        assert sid == owner
+        assert mask & ntsecuritycon.FILE_GENERIC_READ
+
+
+def test_oauth_clients_and_tokens_survive_a_new_provider(tmp_path: Path, monkeypatch) -> None:
     import asyncio
 
+    import desktop_agent.control.pc_control.oauth as oauth_mod
     from desktop_agent.control.pc_control.oauth import LocalDesktopOAuth
 
     path = tmp_path / "pc-oauth.json"
+    neighbor = tmp_path / "neighbor.txt"
+    neighbor.write_text("keep", encoding="utf-8")
+    stale = path.with_suffix(path.suffix + ".tmp")
+    stale.write_bytes(b"stale-marker")
+    cycles: list[dict] = []
+    real_open = oauth_mod._open_exclusive
+    real_owner = oauth_mod._owner_only
+    real_write = oauth_mod.os.write
+    real_fsync = oauth_mod.os.fsync
+    real_close = oauth_mod.os.close
+    real_replace = oauth_mod.os.replace
+
+    def tracked_open(target: Path) -> int:
+        fd = real_open(target)
+        assert target.stat().st_size == 0
+        try:
+            extra = real_open(target)
+        except Exception:
+            exclusive = True
+        else:
+            os.close(extra)
+            exclusive = False
+        cycles.append({"fd": fd, "exclusive": exclusive, "steps": ["open"], "closed": False})
+        return fd
+
+    def tracked_owner(fd: int) -> None:
+        cycle = cycles[-1]
+        assert fd == cycle["fd"]
+        assert cycle["closed"] is False
+        os.fstat(fd)
+        real_owner(fd)
+        cycle["steps"].append("restrict")
+
+    def tracked_write(fd: int, data) -> int:
+        cycle = cycles[-1]
+        assert fd == cycle["fd"]
+        assert cycle["closed"] is False
+        assert "restrict" in cycle["steps"]
+        os.fstat(fd)
+        cycle["steps"].append("write")
+        return real_write(fd, data)
+
+    def tracked_fsync(fd: int) -> None:
+        cycle = cycles[-1]
+        assert fd == cycle["fd"]
+        assert cycle["steps"][-1] == "write"
+        assert cycle["closed"] is False
+        cycle["steps"].append("fsync")
+        real_fsync(fd)
+
+    def tracked_close(fd: int) -> None:
+        cycle = cycles[-1]
+        if fd == cycle["fd"] and not cycle["closed"]:
+            assert cycle["steps"][-1] == "fsync"
+            cycle["steps"].append("close")
+            cycle["closed"] = True
+        real_close(fd)
+
+    def tracked_replace(src, dst) -> None:
+        cycle = cycles[-1]
+        assert cycle["closed"] is True
+        assert cycle["steps"][-1] == "close"
+        cycle["steps"].append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(oauth_mod, "_open_exclusive", tracked_open)
+    monkeypatch.setattr(oauth_mod, "_owner_only", tracked_owner)
+    monkeypatch.setattr(oauth_mod.os, "write", tracked_write)
+    monkeypatch.setattr(oauth_mod.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(oauth_mod.os, "close", tracked_close)
+    monkeypatch.setattr(oauth_mod.os, "replace", tracked_replace)
 
     async def issue() -> str:
         provider = LocalDesktopOAuth(path)
@@ -300,7 +428,7 @@ def test_oauth_clients_and_tokens_survive_a_new_provider(tmp_path: Path) -> None
             "fGTSoieUnojA4VEH36u1nRV5mBtM57E4",
             "https://sesameai.app/api/oauth/external-mcp/callback",
         )
-        await provider.load_access_token("sesame-stored-empty-scope")
+        assert await provider.load_access_token("sesame-stored-empty-scope") is None
         from mcp.server.auth.provider import AuthorizationParams
         from pydantic import AnyUrl
 
@@ -323,8 +451,14 @@ def test_oauth_clients_and_tokens_survive_a_new_provider(tmp_path: Path) -> None
     assert "fGTSoieUnojA4VEH36u1nRV5mBtM57E4" in reloaded._clients
     assert token in reloaded._access
     assert reloaded._access[token].expires_at is None
-    assert "sesame-stored-empty-scope" in reloaded._access
-    assert path.stat().st_mode & 0o077 == 0
+    assert "sesame-stored-empty-scope" not in reloaded._access
+    _assert_token_file_private(path)
+    assert cycles
+    for cycle in cycles:
+        assert cycle["exclusive"] is True
+        assert cycle["steps"] == ["open", "restrict", "write", "fsync", "close", "replace"]
+    assert not stale.exists()
+    assert neighbor.read_text(encoding="utf-8") == "keep"
 
 
 def _payload(result) -> dict:
@@ -338,6 +472,15 @@ def _payload(result) -> dict:
     for block in result.content:
         text += getattr(block, "text", "") or ""
     return json.loads(text)
+
+
+def _ticket_from_page(page: bytes) -> str:
+    import re
+
+    found = re.search(rb'name="ticket" value="([^"]+)"', page)
+    if found is None:
+        raise AssertionError(f"authorize page has no ticket: {page[:300]!r}")
+    return found.group(1).decode()
 
 
 def _pinggy_oauth_roundtrip(port: int) -> dict:
@@ -439,6 +582,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
     authorize_status, _authorize_headers, authorize_body = request("GET", f"/authorize?{query}")
     if authorize_status != 200 or b"Allow" not in authorize_body:
         raise AssertionError(f"authorize {authorize_status}: {authorize_body!r}")
+    ticket = _ticket_from_page(authorize_body)
     approved_status, approved_headers, approved_body = request(
         "POST",
         "/authorize",
@@ -452,6 +596,8 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
                 "state": "miles",
                 "resource": DEFAULT_PUBLIC_ORIGIN,
                 "decision": "approve",
+                "ticket": ticket,
+                "pin": _TEST_PIN,
             }
         ).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -725,9 +871,8 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
             "mcp-protocol-version": "2025-11-25",
         },
     )
-    if stored_status != 200:
+    if stored_status != 401:
         raise AssertionError(f"stored empty-scope tools/list {stored_status}: {stored_body!r}")
-    stored_tools = [tool["name"] for tool in json.loads(stored_body.decode())["result"]["tools"]]
     sesame = _sesame_unknown_client(request)
     www = unauthenticated_headers.get("www-authenticate", "")
     return {
@@ -754,7 +899,7 @@ def _pinggy_oauth_roundtrip(port: int) -> dict:
         "sesame_access_token": sesame["access_token"],
         "sesame_scopes": sesame["scopes"],
         "www_authenticate": www,
-        "stored_tools": stored_tools,
+        "stored_status": stored_status,
         "negotiated_protocol": negotiated_protocol,
         "second_call": second_status,
         "after_delete": after_status,
@@ -810,6 +955,19 @@ def _sesame_unknown_client(request) -> dict:
 
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    approve_query = urlencode(
+        {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": resource,
+            "state": state,
+        }
+    )
+    _approve_status, _approve_headers, approve_page = request("GET", f"/authorize?{approve_query}")
+    ticket = _ticket_from_page(approve_page)
     approved_status, approved_headers, approved_body = request(
         "POST",
         "/authorize",
@@ -823,6 +981,8 @@ def _sesame_unknown_client(request) -> dict:
                 "resource": resource,
                 "state": state,
                 "decision": "approve",
+                "ticket": ticket,
+                "pin": _TEST_PIN,
             }
         ).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -856,37 +1016,6 @@ def _sesame_unknown_client(request) -> dict:
         "access_token": issued["access_token"],
         "scopes": (issued.get("scope") or "").split(),
     }
-
-
-def _drain(proc: subprocess.Popen[str]) -> str:
-    """Read the listener pipe, including bytes ``readline`` already buffered.
-
-    ``select`` on the text stream misses lines sitting in the ``BufferedReader``
-    after the first ``readline`` prefetched them. A non-blocking ``readline``
-    returns that buffer, then raises ``BlockingIOError`` when the pipe is empty.
-    """
-    import os
-
-    if proc.stdout is None:
-        return ""
-    os.set_blocking(proc.stdout.fileno(), False)
-    chunks: list[str] = []
-    deadline = time.time() + 2
-    while time.time() < deadline:
-        try:
-            line = proc.stdout.readline()
-        except BlockingIOError:
-            if "tools/call click" in "".join(chunks):
-                break
-            time.sleep(0.05)
-            continue
-        if line:
-            chunks.append(line)
-            continue
-        if proc.poll() is not None:
-            break
-        time.sleep(0.05)
-    return "".join(chunks)
 
 
 def test_sesame_origin_is_removed_before_the_sdk() -> None:
@@ -963,7 +1092,7 @@ def _boot_listener(site: Path, cwd: Path, port: int) -> tuple[subprocess.Popen[s
     (site / "sitecustomize.py").write_text(
         textwrap.dedent(
             """
-            import ctypes, sys, types
+            import ctypes, os, sys, types
 
             class _Win:
                 def __getattr__(self, name):
@@ -971,8 +1100,9 @@ def _boot_listener(site: Path, cwd: Path, port: int) -> tuple[subprocess.Popen[s
                 def __call__(self, *args, **kwargs):
                     return self
 
-            ctypes.windll = _Win()
-            ctypes.WinDLL = lambda *args, **kwargs: _Win()
+            if os.name != "nt":
+                ctypes.windll = _Win()
+                ctypes.WinDLL = lambda *args, **kwargs: _Win()
 
             def _mod(name):
                 module = types.ModuleType(name)

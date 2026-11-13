@@ -342,8 +342,53 @@ async def _ocr(png):
     return out
 
 def ocr_items(img):
-    b = io.BytesIO(); Image.fromarray(img[:, :, ::-1]).save(b, "PNG")
-    return asyncio.run(_ocr(b.getvalue()))
+    """Run OCR on one MTA daemon thread. The UI Automation thread only waits.
+
+    ``_ocr`` is not run on the STA ``pc-control-main`` thread. The wait is 8
+    seconds. A thread that is still running, or an earlier one that never
+    finished, returns ``[]`` so look falls through to UI Automation or the
+    image. A stuck worker does not start another.
+    """
+    import threading
+    lock = ocr_items.__dict__.setdefault("_lock", threading.Lock())
+    with lock:
+        worker = ocr_items.__dict__.get("_worker")
+        if worker is not None and worker.is_alive():
+            return []
+        b = io.BytesIO()
+        Image.fromarray(img[:, :, ::-1]).save(b, "PNG")
+        png = b.getvalue()
+        box = {"items": []}
+
+        def run():
+            ole32 = ctypes.windll.ole32
+            init = ole32.CoInitializeEx
+            if hasattr(init, "argtypes"):
+                init.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                init.restype = ctypes.c_long
+            try:
+                hr = int(init(None, 0))          # COINIT_MULTITHREADED, not the STA
+            except Exception:
+                return
+            if hr < 0:
+                return
+            try:
+                box["items"] = list(asyncio.run(_ocr(png)) or [])
+            except Exception:
+                box["items"] = []
+            finally:
+                try:
+                    ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+        worker = threading.Thread(target=run, name="pc-control-ocr", daemon=True)
+        ocr_items._worker = worker
+        worker.start()
+    worker.join(8)
+    if worker.is_alive():
+        return []
+    return box["items"]
 
 def grid(items, w, h):
     rows_n = max(20, min(70, h // 18)); cols = 120

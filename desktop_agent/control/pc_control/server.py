@@ -127,10 +127,21 @@ def _paused():
         raise PermissionError("PC-Control is paused (PAUSE).")
 
 
-def _gate(window, act, confirm=False):
+def _gate(window, act, confirm=False, action="window"):
+    """``confirm`` from a caller is ignored. Only the person at this PC can allow the call."""
     _paused()
     hwnd = core.find_window(window)
-    policy.check_window(policy.mode(), _proc(hwnd), win32gui.GetWindowText(hwnd), act, _allowed(), confirm, hwnd)
+    from . import local_approval
+    if local_approval.is_approval_window(hwnd):
+        raise ToolError("PC-Control will not operate its own approval window.")
+    proc = _proc(hwnd)
+    title = win32gui.GetWindowText(hwnd)
+    why = policy.needs_ask(policy.mode(), proc, title)
+    local_approval.decide(why, action, hwnd)
+    if policy.mode() == "strict" and act and proc not in _allowed():
+        raise PermissionError(
+            f"acting on '{proc}' is not allowed (strict mode). Add it to PC_CONTROL_ALLOW or ~/.pc-control/allow.txt."
+        )
     return hwnd
 
 
@@ -454,7 +465,7 @@ def windows(filter: str = "") -> str:
 def look(window: str, mode: str = "auto", find: str = "", wait: float = 0, confirm: bool = False):
     """See a window without focusing it: UI-tree text, OCR or an image with numbered marks, whichever is cheapest (keep mode=auto). Elements are [id:name]; ids stay valid (find never renumbers). 'blind n/m' = zones with content but no text (mode=image shows them). window = title substring or hwnd. find="Save|Cancel": only the matching elements, also out of view (cheapest way to locate something); "!Loading" = until that text is gone; wait=N seconds polls."""
     def run(hidden):
-        hwnd = _gate(window, False, confirm)
+        hwnd = _gate(window, False, confirm, action="look")
         if find:
             return actions.find(str(hwnd), find, wait)
         r = core.look(str(hwnd), mode)
@@ -473,7 +484,7 @@ def click(window: str, target: str, right: bool = False, double: bool = False, c
     """Click an element (its id from look(), or its exact name), or 'x,y' in pixels of the last image (right/double click too). Re-aims by itself if the window moved; says whether it had a visible effect. Word formatting buttons apply only to the text Claude writes. Delicate actions (pay, delete, send, install) ask the user first."""
     def run(hidden):
         _TR.clear(); _tr("t0")
-        hwnd = _gate(window, True, confirm)
+        hwnd = _gate(window, True, confirm, action="click")
         cat0 = _category(hwnd)                              # what the user was (or was not) asked about: re-checked right before acting
         t = _target(target, True, hwnd)
         it = core._state.get(hwnd, {}).get("items", {}).get(t) if isinstance(t, int) else None
@@ -533,7 +544,7 @@ def click(window: str, target: str, right: bool = False, double: bool = False, c
 def type(window: str, target: str, text: str, replace: bool = False, confirm: bool = False) -> str:
     """Type into an element (id from look(), or its name; appends, replace=true replaces). No blind typing. On a drop-down or list it selects the entry with that text. Excel: target can be a cell (B3, Sheet2!A1; '=...' = formula). Word: writes at Claude's OWN insertion point, not the user's caret, and says where. Answers with what changed."""
     def run(hidden):
-        hwnd = _gate(window, True, confirm)
+        hwnd = _gate(window, True, confirm, action="type")
         if office.is_excel(hwnd) and office.is_cell(target):  # Excel: a cell by address (B3, Sheet2!A1), never the user's selection
             policy.check_type(policy.mode(), str(target), False)
             return _act(hwnd, hidden, lambda: office.write(hwnd, str(target), text) or "did not type: this Excel window exposes no workbook")
@@ -580,7 +591,7 @@ def type(window: str, target: str, text: str, replace: bool = False, confirm: bo
 def drag(window: str, points: str, shape: str = "path", right: bool = False, confirm: bool = False) -> str:
     """Drag (draw, select, move) through points "x1,y1;x2,y2;..." in pixels of the last image. shape: path, line, rect or ellipse (2 points for the last three). Check the result with look mode=image."""
     def run(hidden):
-        hwnd = _gate(window, True, confirm)
+        hwnd = _gate(window, True, confirm, action="drag")
         cat0 = _category(hwnd)
         try:
             pts = [tuple(int(float(v)) for v in p.split(",")) for p in points.replace(" ", "").split(";") if p]
@@ -606,7 +617,7 @@ def drag(window: str, points: str, shape: str = "path", right: bool = False, con
 def key(window: str, name: str, confirm: bool = False) -> str:
     """A key (enter, tab, esc, arrows, backspace, delete, home, end, pgup, pgdn, space, f1-f12) or a shortcut (ctrl+s, alt+f4). Shortcuts run the app's own command, never real keys; if missing, the answer lists the app's shortcuts (language-dependent). Word: only enter, space, backspace, at Claude's insertion point."""
     def run(hidden):
-        hwnd = _gate(window, True, confirm)
+        hwnd = _gate(window, True, confirm, action="key")
         cat0 = _category(hwnd)
         _key_guard(hwnd, name, confirm)
         _recheck_window(hwnd, cat0)
@@ -618,7 +629,7 @@ def key(window: str, name: str, confirm: bool = False) -> str:
 def scroll(window: str, direction: str = "down", target: str = "", amount: int = 1, confirm: bool = False) -> str:
     """Scroll the window or an element id by `amount` pages: up|down|left|right|top|bottom. Then look again (old ids still work)."""
     def run(hidden):
-        hwnd = _gate(window, False, confirm)
+        hwnd = _gate(window, False, confirm, action="scroll")
         return _act(hwnd, hidden, lambda: actions.scroll(str(hwnd), _target(target, False, hwnd) if str(target).strip() else None, direction, amount))
     return _on(window, run)
 
@@ -627,7 +638,7 @@ def scroll(window: str, direction: str = "down", target: str = "", amount: int =
 def read(window: str, target: str = "", start: int = 0, length: int = 6000, find: str = "", confirm: bool = False) -> str:
     """The WHOLE text of the window's document, page or editor (also out of view), or of an element, in pieces (start/length, 6000 characters by default). find=\"a|b\": only the matching lines, numbered. Excel: the cells; PowerPoint: slides and notes. Cheaper than scrolling and looking. Never reads password fields."""
     def run(hidden):
-        hwnd = _gate(window, False, confirm)
+        hwnd = _gate(window, False, confirm, action="read")
         tgt = _target(target, False, hwnd) if str(target).strip() else None
         if not find.strip():
             return actions.read_text(str(hwnd), tgt, start, length)
@@ -645,7 +656,7 @@ def read(window: str, target: str = "", start: int = 0, length: int = 6000, find
 def show(window: str, target: str, label: str = "", seconds: int = 10, confirm: bool = False) -> str:
     """Show the USER where something is (for "where do I click to...?"): an orange circle around the element `target` (its id, name or x,y), optional label. Nothing is clicked; it goes when they click it or it changes."""
     def run(hidden):
-        hwnd = _gate(window, False, confirm)
+        hwnd = _gate(window, False, confirm, action="show")
         if hidden:
             raise ToolError("that window is on the hidden desktop: the user cannot see it")
         if win32gui.IsIconic(hwnd):
@@ -689,7 +700,18 @@ def open_app(command: str, hidden: bool = False, confirm: bool = False) -> str:
         exe = os.path.splitext(os.path.basename(shlex.split(command, posix=False)[0].strip('"')))[0].lower()
     except (ValueError, IndexError):
         raise ToolError("bad command: give the program (quoted if it has spaces) and its arguments, e.g. notepad.exe \"my notes.txt\"")
-    policy.check_launch(policy.mode(), exe, _allowed(), confirm, " ".join(shlex.split(command, posix=False)[1:]))
+    args = " ".join(shlex.split(command, posix=False)[1:])
+    from . import local_approval
+    why = policy.needs_ask(policy.mode(), exe)
+    if (
+        not why
+        and policy.mode() != "bypass"
+        and exe in policy.LAUNCHERS
+        and (policy.SCRIPT_ARG.search(args or "") or re.search(r"\.exe\b", args or "", re.I))
+    ):
+        why = "terminal or console"
+    local_approval.decide(why, "open_app", 0)
+    policy.check_launch(policy.mode(), exe, _allowed(), True, args)
     if hidden:
         r = DESK.open(command); where = "hidden desktop (no taskbar button)"
     else:
